@@ -6,7 +6,7 @@ import subprocess
 import sys
 import urllib.request
 
-DELIVERY_REV = "5b8fbfedf0e649b518e5af75539c81fbd1710600"
+DELIVERY_REV = "a00aba618890397ef40d1a16b22b094d8afd0a62"
 DELIVERY_URL = "https://github.com/logos-messaging/logos-delivery.git"
 DELIVERY_DEPS_URL = (
     "https://raw.githubusercontent.com/logos-messaging/logos-delivery/"

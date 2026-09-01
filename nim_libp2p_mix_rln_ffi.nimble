@@ -11,7 +11,7 @@ license     = "MIT OR Apache-2.0"
 # and the Mix-RLN plugin to one compatible dependency graph.
 # nim-ffi at the pinned SHA requires nim >= 2.2.6.
 requires "nim >= 2.2.6"
-requires "chronos >= 4.2.2"
+requires "chronos == 4.2.5"
 requires "chronicles >= 0.11.0"
 requires "results >= 0.4.0"
 requires "stew >= 0.4.2"
@@ -22,9 +22,9 @@ requires "taskpools >= 0.1.0"
 # Match Delivery's nim-ffi/CBOR toolchain to avoid a second serialization graph.
 requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
-# Exact head of logos-delivery PR #4182. Keep this immutable while the stacked
+# Exact head of logos-delivery PR #4185. Keep this immutable while the stacked
 # Delivery integration PRs are awaiting merge.
-requires "https://github.com/logos-messaging/logos-delivery.git#5b8fbfedf0e649b518e5af75539c81fbd1710600"
+requires "https://github.com/logos-messaging/logos-delivery.git#a00aba618890397ef40d1a16b22b094d8afd0a62"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:

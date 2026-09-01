@@ -105,7 +105,7 @@ with the checked-in lockfile. The hermetic Nix build uses the same exact pins
 without invoking that solver.
 
 [libp2p]: https://github.com/vacp2p/nim-libp2p
-[delivery]: https://github.com/logos-messaging/logos-delivery/pull/4182
+[delivery]: https://github.com/logos-messaging/logos-delivery/pull/4185
 [mix]: https://github.com/logos-co/nim-libp2p-mix
 [mix-rln]: https://github.com/logos-co/mix-rln-spam-protection-plugin
 [logos-mod]: https://github.com/logos-co/logos-libp2p-mix-rln

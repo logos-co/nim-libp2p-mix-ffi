@@ -158,8 +158,8 @@
 
   logos_delivery = pkgs.fetchgit {
     url = "https://github.com/logos-messaging/logos-delivery.git";
-    rev = "5b8fbfedf0e649b518e5af75539c81fbd1710600";
-    sha256 = "131vy02jn992z36naq6rx259xrhy9yxfhqsz16afi3fpykyn8qj4";
+    rev = "a00aba618890397ef40d1a16b22b094d8afd0a62";
+    sha256 = "0qd1g7zr8b93lisqrqaym7gcxb95mwgbj133z5kll5z25zjnfrj0";
     fetchSubmodules = true;
   };
 
@@ -263,8 +263,8 @@
 
   snappy = pkgs.fetchgit {
     url = "https://github.com/status-im/nim-snappy";
-    rev = "da2f0c7b6ce9053106e9bb098204fe5319038387";
-    sha256 = "1jmjh1b70wkhzmyzvp46y50x3i1f0hkdrpy6msvqix60xwkxf1zy";
+    rev = "a99d113197e81bf764a3b005b0ade3f9f3758069";
+    sha256 = "0fbr352m01psi3f25c3gi95yimrjmvsh10wckywscn0603iqzpjl";
     fetchSubmodules = true;
   };
 
