@@ -1,6 +1,6 @@
-// 3-node end-to-end smoke test driven entirely through the C FFI.
+// 5-node end-to-end smoke test driven entirely through the C FFI.
 //
-// Spins up three LibMixRln contexts in one process, cross-registers their
+// Spins up five LibMixRln contexts in one process, cross-registers their
 // mix peer records so each node's Sphinx path selector knows the others,
 // mounts a `/logosmix/test/echo/1.0.0` receiver on node C, and calls
 // `sendMixMessage(destPeerId=C, proto=/logosmix/test/echo/1.0.0,
@@ -241,94 +241,6 @@ static int stop_node(LibMixRlnCtx* ctx) {
     return 0;
 }
 
-// -------- RLN coord bus ---------------------------------------------------
-//
-// In production, an RLN publish_requested event goes out on RLN Relay and is
-// re-delivered to every other node's plugin via the coord channel. For this
-// in-process test we bridge synchronously: onRlnPublishRequested captures the
-// frame, and after each origin op we drain the queue into every other node's
-// `libp2pMixRlnDeliverCoordFrame`.
-
-typedef struct {
-    uint8_t*    data;
-    size_t      len;
-    char*       topic;
-} CoordFrame;
-
-typedef struct {
-    pthread_mutex_t m;
-    CoordFrame*     frames;
-    size_t          count;
-    size_t          cap;
-} CoordBus;
-
-static CoordBus g_bus;
-
-static void bus_init(void) {
-    pthread_mutex_init(&g_bus.m, NULL);
-    g_bus.frames = NULL; g_bus.count = 0; g_bus.cap = 0;
-}
-
-static void bus_push(const char* topic, size_t topic_len,
-                     const uint8_t* data, size_t data_len) {
-    pthread_mutex_lock(&g_bus.m);
-    if (g_bus.count == g_bus.cap) {
-        g_bus.cap = g_bus.cap ? g_bus.cap * 2 : 8;
-        g_bus.frames = realloc(g_bus.frames, g_bus.cap * sizeof(CoordFrame));
-    }
-    CoordFrame* f = &g_bus.frames[g_bus.count++];
-    f->topic = strndup(topic, topic_len);
-    f->data = malloc(data_len);
-    memcpy(f->data, data, data_len);
-    f->len = data_len;
-    pthread_mutex_unlock(&g_bus.m);
-}
-
-static void bus_clear(void) {
-    pthread_mutex_lock(&g_bus.m);
-    for (size_t i = 0; i < g_bus.count; i++) {
-        free(g_bus.frames[i].topic);
-        free(g_bus.frames[i].data);
-    }
-    g_bus.count = 0;
-    pthread_mutex_unlock(&g_bus.m);
-}
-
-static void on_rln_publish(const RlnPublishRequestedEvent* evt, void* ud) {
-    (void)ud;
-    if (!evt) return;
-    bus_push(evt->contentTopic.data, evt->contentTopic.len,
-             evt->payload.data, evt->payload.len);
-}
-
-// Delivers every buffered frame to every ctx in `nodes` (skipping self is
-// harmless — plugin.handleMembershipUpdate is idempotent). Clears the bus.
-static int drain_bus_to_all(LibMixRlnCtx** nodes, int n) {
-    pthread_mutex_lock(&g_bus.m);
-    size_t count = g_bus.count;
-    CoordFrame* frames = g_bus.frames;
-    for (size_t i = 0; i < count; i++) {
-        RlnCoordFrame req;
-        memset(&req, 0, sizeof(req));
-        req.contentTopic = nimffi_str(frames[i].topic);
-        req.data.data = frames[i].data;
-        req.data.len  = frames[i].len;
-        for (int k = 0; k < n; k++) {
-            Waiter w; waiter_init(&w);
-            (void)libp2p_mix_rln_ctx_deliver_coord_frame(nodes[k], &req, on_bool, &w);
-            if (waiter_wait(&w, 10) != 0) {
-                fprintf(stderr, "deliver_coord_frame TIMEOUT on node %d\n", k);
-                pthread_mutex_unlock(&g_bus.m);
-                return -1;
-            }
-            // Non-zero err_code is fine when the plugin already knows the frame.
-        }
-    }
-    pthread_mutex_unlock(&g_bus.m);
-    bus_clear();
-    return 0;
-}
-
 static void on_membership(int ec, const RlnMembershipStatus* r,
                           const char* em, void* ud) {
     Waiter* w = (Waiter*)ud;
@@ -395,21 +307,13 @@ int main(void) {
     LibMixRlnCtx* C = nodes[N - 1];  // exit / destination
     MixPeerRecord* recC = &recs[N - 1];
 
-    // Bridge the RLN coord bus: subscribe every node's onRlnPublishRequested
-    // to a shared queue, then after every registerSelf drain the queue into
-    // every node's DeliverCoordFrame. Without this, each plugin's Merkle
-    // tree only has its OWN commitment, verification along the mix path
-    // fails, and the exit rejects the packet.
-    bus_init();
+    // Membership updates propagate over Delivery Relay. Registrations remain
+    // sequential until distributed member-index allocation is implemented.
     for (int i = 0; i < N; i++)
-        (void)libp2p_mix_rln_ctx_add_on_rln_publish_requested_listener(
-            nodes[i], on_rln_publish, NULL);
-
-    for (int i = 0; i < N; i++) {
         if (register_membership(nodes[i], i)) return 1;
-        if (drain_bus_to_all(nodes, N)) return 1;
-    }
-    fprintf(stderr, "[smoke] all RLN memberships registered and synced\n");
+    struct timespec relay_settle = { .tv_sec = 2, .tv_nsec = 0 };
+    nanosleep(&relay_settle, NULL);
+    fprintf(stderr, "[smoke] all RLN memberships registered over Delivery Relay\n");
 
     // Mount receiver on C.
     MountReceiverRequest mreq;

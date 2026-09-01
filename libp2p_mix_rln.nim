@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 # Copyright (c) Logos
 
-## C FFI facade composing nim-libp2p + nim-libp2p-mix + mix-rln-spam-protection-plugin.
+## C FFI facade composing Logos Delivery + nim-libp2p-mix + Mix-RLN.
 ##
 ## Modelled on vacp2p/nim-libp2p `cbind/libp2p.nim`: `{.ffi.}` types become
 ## CBOR-encoded request/response objects, `{.ffi.}` procs become C-exported
@@ -10,27 +10,27 @@
 ## Consumed by [logos-libp2p-mix-rln](https://github.com/logos-co/logos-libp2p-mix-rln)
 ## via its `metadata.json` `nix.external_libraries` entry.
 ##
-## STATUS: second pass. Real bodies for lifecycle, mix send (via
-## `MixProtocol.toConnection` at pinned SHA `c387ca67…`), and RLN plugin
-## wiring (via `Opt.some(SpamProtection(plugin))` + `SpamProtectionDelayStrategy`).
-## `{.ffiEvent.}` bridges for RLN publish + incoming mix message emit outward.
+## Delivery owns the node lifecycle, Relay coordination, and the switch used by
+## Mix. `{.ffiEvent.}` bridges expose incoming mix messages and registration.
 ## SURB reply, RLN membership index, MixPublicKey introspection still stubbed.
 
 import ffi
 
-import std/[strutils, tables]
+import std/[net, strutils, tables]
 import chronos
 import chronicles
 import results
 
-# nim-libp2p — dragged in transitively at v2.1.4 via mix_rln_spam_protection.
-import libp2p/[switch, builders, multiaddress, peerid]
+# Delivery owns the only libp2p switch used by this facade.
+import libp2p/[multiaddress, peerid, switch]
 import libp2p/crypto/[crypto, secp]
+import libp2p/crypto/curve25519 as lp_curve25519
+import libp2p/protocols/connectivity/relay/relay as circuit_relay
 import libp2p/stream/[connection, lpstream]
 
 # nim-libp2p-mix — Sphinx routing + mix protocol.
 import libp2p_mix
-import libp2p_mix/[mix_protocol, mix_node, curve25519, delay_strategy, pool]
+import libp2p_mix/[mix_protocol, mix_node, curve25519, pool]
 
 # Receiver-side helpers: mounting a plain LPProtocol on the exit switch so
 # `exit_is_dest` mode can dispatch the payload into a host-visible handler.
@@ -39,6 +39,12 @@ import stew/byteutils
 
 # mix-rln-spam-protection-plugin — per-hop RLN proof gen/verify.
 import mix_rln_spam_protection
+import mix_rln_spam_protection/spam_protection as mix_rln
+
+import
+  logos_delivery/waku/[waku_core, waku_node],
+  logos_delivery/waku/factory/[networks_config, node_factory, waku_conf],
+  logos_delivery/waku/factory/conf_builder/conf_builder
 
 # LibMixRln ------------------------------------------------------------------
 
@@ -46,13 +52,13 @@ type LibMixRln* = ref object
   ## Owned per FFI context. Every `{.ffi.}` proc receives one as its `lib`
   ## receiver and mutates through it. Lifetime is bounded by `libp2pMixRlnCreate`
   ## / `libp2pMixRlnDestroy`.
-  rng: Rng
-  switch: Switch
+  node: WakuNode
   mixProto: MixProtocol
   rlnPlugin: MixRlnSpamProtection
-  mixNodeInfo: MixNodeInfo
+  mixPubKey: seq[byte]
   coverRateFraction: float64
   running: bool
+  stopped: bool
 
 declareLibrary("libp2p_mix_rln", LibMixRln)
 
@@ -151,8 +157,7 @@ type RlnMembershipRegisteredEvent {.ffi.} = object
   root: seq[byte]
 
 type RlnPublishRequestedEvent {.ffi.} = object
-  ## RLN plugin wants a membership / metadata frame published to the RLN Relay
-  ## coord layer. The host is expected to relay `payload` on `contentTopic`.
+  ## Legacy host-publish event retained for C ABI compatibility.
   contentTopic: string
   payload: seq[byte]
 
@@ -167,23 +172,44 @@ proc onRlnMembershipRegistered*(
   ## Fired after `libp2pMixRlnRegisterRlnMembership` succeeds.
 
 proc onRlnPublishRequested*(event: RlnPublishRequestedEvent) {.ffiEvent.} =
-  ## Fired by the RLN plugin whenever it needs to broadcast a frame. Host is
-  ## expected to route this to the Logos-messaging RLN Relay coord channel.
+  ## Retained for C ABI compatibility. Delivery now publishes coordination
+  ## frames directly through Relay, so new hosts should not subscribe to it.
 
 # ----------------------------------------------------------------------------
 # Config helpers
 # ----------------------------------------------------------------------------
 
-proc portFromMultiaddr(ma: string): int =
-  ## Extracts /tcp/N or /udp/N from a multiaddr string; returns 0 if absent.
+proc listenEndpoint(ma: string): Result[(IpAddress, Port), string] =
+  ## Delivery's factory currently exposes IP + TCP listen configuration.
   let parts = ma.split('/')
+  var address = static parseIpAddress("0.0.0.0")
+  var port = Port(0)
+  var foundAddress = false
+  var foundTcp = false
   var i = 1
   while i + 1 < parts.len:
-    if parts[i] == "tcp" or parts[i] == "udp":
-      try: return parseInt(parts[i + 1])
-      except ValueError: return 0
-    inc i
-  0
+    case parts[i]
+    of "ip4", "ip6":
+      try:
+        address = parseIpAddress(parts[i + 1])
+        foundAddress = true
+      except ValueError:
+        return err("invalid listen IP address: " & parts[i + 1])
+    of "tcp":
+      try:
+        let value = parseInt(parts[i + 1])
+        if value < 0 or value > high(uint16).int:
+          return err("listen TCP port is out of range: " & parts[i + 1])
+        port = Port(value)
+        foundTcp = true
+      except ValueError:
+        return err("invalid listen TCP port: " & parts[i + 1])
+    else:
+      discard
+    i += 2
+  if not foundAddress or not foundTcp:
+    return err("listen multiaddr must contain an IP address and TCP port: " & ma)
+  ok((address, port))
 
 proc decodeHexPrivKey(hex: string, rng: Rng): SkPrivateKey {.raises: [].} =
   ## Decodes a hex-encoded raw Secp256k1 private key. Falls back to a fresh
@@ -207,39 +233,7 @@ proc decodeHexPrivKey(hex: string, rng: Rng): SkPrivateKey {.raises: [].} =
 # Constructor / destructor
 # ----------------------------------------------------------------------------
 
-proc buildSwitch(cfg: MixRlnConfig, rng: Rng): Result[Switch, string] {.raises: [].} =
-  ## Builds the libp2p Switch per LIP LOGOS-MIXNET: TCP + Noise + Mplex.
-  ## QUIC support is left for the transport-selector follow-up.
-  let skkey = decodeHexPrivKey(cfg.privKeyHex, rng)
-  let privKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
-  let listen =
-    if cfg.addrs.len > 0: cfg.addrs[0]
-    else: "/ip4/0.0.0.0/tcp/0"
-  let addr0 = MultiAddress.init(listen).valueOr:
-    return err("invalid listen multiaddr '" & listen & "': " & $error)
-  try:
-    ok(
-      SwitchBuilder
-        .new()
-        .withRng(rng)
-        .withPrivateKey(privKey)
-        .withAddress(addr0)
-        .withTcpTransport()
-        .withMplex()
-        .withNoise()
-        .build()
-    )
-  except LPError as e:
-    err("SwitchBuilder.build failed: " & e.msg)
-  except CatchableError as e:
-    err("SwitchBuilder failed: " & e.msg)
-
-proc buildRlnPlugin(
-    cfg: MixRlnConfig
-): Future[Result[MixRlnSpamProtection, string]] {.async.} =
-  ## Builds and initializes the RLN plugin. `setPublishCallback` fires an
-  ## `onRlnPublishRequested` FFI event so the host module can forward the
-  ## frame to whichever Logos-messaging channel implements RLN Relay coord.
+proc buildRlnConfig(cfg: MixRlnConfig): mix_rln.MixRlnConfig =
   var rlnCfg = defaultConfig()
   rlnCfg.keystorePath = cfg.rln.keystorePath
   rlnCfg.keystorePassword = cfg.rln.keystorePassword
@@ -254,84 +248,87 @@ proc buildRlnPlugin(
   # hex-parse helper is added. Falling back to the plugin's default keeps
   # dev/testnet flows working.
 
-  let plugin = MixRlnSpamProtection.new(rlnCfg).valueOr:
-    return err("MixRlnSpamProtection.new failed: " & error)
+  rlnCfg
 
-  (await plugin.init()).isOkOr:
-    return err("MixRlnSpamProtection.init failed: " & error)
+proc buildDeliveryConf(
+    cfg: MixRlnConfig, rng: Rng
+): Result[WakuConf, string] {.raises: [].} =
+  if cfg.transport.len > 0 and cfg.transport != "tcp":
+    return err("Delivery migration currently supports only TCP transport")
 
-  plugin.setPublishCallback(
-    proc(topic: string, data: seq[byte]): Future[Result[void, string]] {.async.} =
-      onRlnPublishRequested(
-        RlnPublishRequestedEvent(contentTopic: topic, payload: data)
-      )
-      return ok()
-  )
+  let listen =
+    if cfg.addrs.len > 0: cfg.addrs[0]
+    else: "/ip4/0.0.0.0/tcp/0"
+  let (listenAddress, listenPort) = listenEndpoint(listen).valueOr:
+    return err(error)
+  if cfg.rln.coordCluster < 0 or cfg.rln.coordCluster > high(uint16).int64:
+    return err("RLN coordination cluster is out of range")
 
-  (await plugin.start()).isOkOr:
-    return err("MixRlnSpamProtection.start failed: " & error)
+  let skkey = decodeHexPrivKey(cfg.privKeyHex, rng)
+  let privateKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
 
-  ok(plugin)
+  var builder = WakuConfBuilder.init()
+  builder.withNodeKey(privateKey)
+  builder.withClusterId(uint16(cfg.rln.coordCluster))
+  builder.withRelay(true)
+  builder.withShardingConf(AutoSharding)
+  builder.withNumShardsInCluster(1)
+  builder.withP2pListenAddress(listenAddress)
+  builder.withP2pTcpPort(listenPort)
+  builder.withMix(true)
+  if cfg.maxConnections > 0:
+    builder.withMaxConnections(cfg.maxConnections)
+
+  builder.mixConf.withEnabled(true)
+  if cfg.mix.mixPrivKeyHex.len > 0:
+    builder.mixConf.withMixKey(cfg.mix.mixPrivKeyHex)
+  builder.mixConf.withMixRln(buildRlnConfig(cfg))
+  builder.build(rng)
 
 proc libp2pMixRlnCreate*(
     cfg: MixRlnConfig
 ): Future[Result[LibMixRln, string]] {.ffiCtor.} =
-  ## Builds Switch, MixProtocol (wired with the RLN plugin as SpamProtection),
-  ## and MixRlnSpamProtection. Mounts the mix protocol on the switch. Does NOT
-  ## start the switch — call `libp2pMixRlnStart` for that.
+  ## Builds one Delivery node and mounts Relay, Mix, and Mix-RLN on its switch.
+  ## Does not start the node — call `libp2pMixRlnStart` for that.
   ##
   ## `{.ffiCtor.}` is nim-ffi's constructor pragma: no library receiver, returns
   ## the freshly-built LibMixRln. Nim-ffi transfers ownership to the C side,
   ## which releases it via the `{.ffiDtor.}` below.
   let rng = newRng()
 
-  # A future revision will accept the mix node info from config; the current
-  # placeholder generates a fresh one on every create, using the listen port
-  # so the mix multiaddr matches the switch's transport.
-  let listenPort =
-    if cfg.addrs.len > 0: portFromMultiaddr(cfg.addrs[0])
-    else: 0
-  let nodeInfo = MixNodeInfo.generateRandom(listenPort, rng)
-
-  let switch = buildSwitch(cfg, rng).valueOr:
+  let conf = buildDeliveryConf(cfg, rng).valueOr:
     return err(error)
-
-  let plugin = (await buildRlnPlugin(cfg)).valueOr:
+  let node = (
+    await setupNode(conf, rng, circuit_relay.Relay.new())
+  ).valueOr:
     return err(error)
-
-  # LIP LOGOS-MIXNET requires per-hop RLN proofs — pass the plugin as
-  # SpamProtection. The plugin docs (and mix_protocol.nim's `new*`) recommend
-  # SpamProtectionDelayStrategy to avoid timing correlation between proof gen
-  # and short exponential delays.
-  let delay = SpamProtectionDelayStrategy.new(rng = rng)
-  let proto = MixProtocol.new(
-    nodeInfo,
-    switch,
-    spamProtection = Opt.some(SpamProtection(plugin)),
-    delayStrategy = Opt.some(DelayStrategy(delay)),
-  )
-
-  switch.mount(proto)
+  if node.wakuMix.isNil() or node.wakuMixRln.isNil():
+    await node.stop()
+    return err("Delivery did not mount Mix-RLN")
+  if node.wakuMix.switch != node.switch:
+    await node.stop()
+    return err("Delivery Mix mounted on a different libp2p switch")
 
   ok(LibMixRln(
-    rng: rng,
-    switch: switch,
-    mixProto: proto,
-    rlnPlugin: plugin,
-    mixNodeInfo: nodeInfo,
+    node: node,
+    mixProto: node.wakuMix,
+    rlnPlugin: node.wakuMixRln,
+    mixPubKey: node.wakuMix.pubKey.getBytes(),
     coverRateFraction: cfg.mix.coverRateFraction,
     running: false,
+    stopped: false,
   ))
 
 proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
-  ## Stops the switch (idempotent) and drops references. The FFI runtime
+  ## Stops the Delivery node (idempotent) and drops references. The FFI runtime
   ## reclaims the LibMixRln object itself.
-  if lib.running:
+  if not lib.stopped:
     try:
-      await lib.switch.stop()
+      await lib.node.stop()
     except CatchableError as e:
-      warn "switch.stop failed", err = e.msg
-    lib.running = false
+      warn "Delivery node stop failed", err = e.msg
+    lib.stopped = true
+  lib.running = false
 
 # ----------------------------------------------------------------------------
 # Lifecycle
@@ -340,20 +337,21 @@ proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
 proc libp2pMixRlnStart*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
   if lib.running: return ok(true)
   try:
-    await lib.switch.start()
+    await lib.node.start()
   except CatchableError as e:
-    return err("switch.start failed: " & e.msg)
+    return err("Delivery node start failed: " & e.msg)
   lib.running = true
+  lib.stopped = false
   ok(true)
 
 proc libp2pMixRlnStop*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
   if not lib.running: return ok(true)
   try:
-    await lib.switch.stop()
+    await lib.node.stop()
   except CatchableError as e:
-    return err("switch.stop failed: " & e.msg)
-  # TODO: await lib.rlnPlugin.stop() once its API is confirmed at the pinned SHA.
+    return err("Delivery node stop failed: " & e.msg)
   lib.running = false
+  lib.stopped = true
   ok(true)
 
 # ----------------------------------------------------------------------------
@@ -367,15 +365,15 @@ proc libp2pMixRlnGetNodeInfo*(
   of NIF_Version:
     ok(NodeInfoResponse(value: "0.1.0"))
   of NIF_PeerId:
-    ok(NodeInfoResponse(value: $lib.switch.peerInfo.peerId))
+    ok(NodeInfoResponse(value: $lib.node.switch.peerInfo.peerId))
   of NIF_Multiaddrs:
     var parts: seq[string]
-    for a in lib.switch.peerInfo.addrs:
+    for a in lib.node.switch.peerInfo.addrs:
       parts.add($a)
     ok(NodeInfoResponse(value: parts.join(",")))
   of NIF_MixPublicKey:
     # Curve25519 pub, 32 bytes, hex-encoded.
-    ok(NodeInfoResponse(value: byteutils.toHex(fieldElementToBytes(lib.mixNodeInfo.mixPubKey))))
+    ok(NodeInfoResponse(value: byteutils.toHex(lib.mixPubKey)))
   of NIF_RlnMembershipIndex:
     err("not implemented — RlnMembershipIndex accessor pending")
 
@@ -386,10 +384,8 @@ proc libp2pMixRlnGetNodeInfo*(
 proc libp2pMixRlnRegisterRlnMembership*(
     lib: LibMixRln
 ): Future[Result[RlnMembershipStatus, string]] {.ffi.} =
-  ## Registers this node in the RLN group. The plugin publishes the
-  ## membership frame via its publish callback, which fires
-  ## `onRlnPublishRequested` — the host is responsible for actually
-  ## sending it on the Logos-messaging RLN Relay coord channel.
+  ## Registers this node in the RLN group. Delivery publishes the membership
+  ## frame over Relay and applies updates received from other nodes.
   let idx = (await lib.rlnPlugin.registerSelf()).valueOr:
     return err("registerSelf failed: " & error)
   # The Merkle root is available via the group manager; wire it into the
@@ -495,15 +491,15 @@ proc libp2pMixRlnGetLocalMixPeerRecord*(
     lib: LibMixRln
 ): Future[Result[MixPeerRecord, string]] {.ffi.} =
   var addrs: seq[string]
-  for a in lib.switch.peerInfo.addrs:
+  for a in lib.node.switch.peerInfo.addrs:
     addrs.add($a)
   # The libp2p pub key in MixNodeInfo is an SkPublicKey (raw secp256k1 pub).
   # `toRaw` gives 33 compressed bytes.
-  let libp2pPubKeyBytes = lib.mixNodeInfo.libp2pPubKey.getBytes()
+  let libp2pPubKeyBytes = lib.node.switch.peerInfo.publicKey.skkey.getBytes()
   ok(MixPeerRecord(
-    peerId: $lib.switch.peerInfo.peerId,
+    peerId: $lib.node.switch.peerInfo.peerId,
     multiaddrs: addrs,
-    mixPubKey: fieldElementToBytes(lib.mixNodeInfo.mixPubKey),
+    mixPubKey: lib.mixPubKey,
     libp2pPubKeyHex: byteutils.toHex(libp2pPubKeyBytes),
   ))
 
@@ -526,6 +522,15 @@ proc libp2pMixRlnAddMixPeer*(
   let libp2pPub = SkPublicKey.init(libp2pPubBytes).valueOr:
     return err("SkPublicKey.init failed: " & $error)
   lib.mixProto.nodePool.add(MixPubInfo.init(peerId, ma, mixPub, libp2pPub))
+  let remote = RemotePeerInfo.init(
+    peerId,
+    @[ma],
+    mixPubKey = Opt.some(lp_curve25519.intoCurve25519Key(rec.mixPubKey)),
+  )
+  try:
+    await lib.node.connectToNodes(@[remote], "mix FFI")
+  except CatchableError as exc:
+    return err("failed to connect Delivery peer: " & exc.msg)
   ok(true)
 
 type RlnCoordFrame {.ffi.} = object
@@ -538,10 +543,8 @@ type RlnCoordFrame {.ffi.} = object
 proc libp2pMixRlnDeliverCoordFrame*(
     lib: LibMixRln, frame: RlnCoordFrame
 ): Future[Result[bool, string]] {.ffi.} =
-  ## Routes a coord frame received on the RLN Relay coord channel into the
-  ## local plugin. Pairs with the `onRlnPublishRequested` event: hosts that
-  ## observe an outbound publish request must forward the same frame to every
-  ## other node's `DeliverCoordFrame` for the group to converge.
+  ## Legacy injection path retained for C ABI compatibility. Delivery normally
+  ## routes coordination frames from Relay into the local plugin.
   let plugin = lib.rlnPlugin
   if frame.contentTopic == plugin.getMembershipContentTopic():
     let r = await plugin.handleMembershipUpdate(frame.data)
@@ -585,7 +588,7 @@ proc libp2pMixRlnMountReceiver*(
     await p.start()
   except CatchableError as e:
     return err("receiver LPProtocol.start failed: " & e.msg)
-  lib.switch.mount(p)
+  lib.node.switch.mount(p)
   lib.mixProto.registerDestReadBehavior(codec, readLp(maxSize))
   ok(true)
 

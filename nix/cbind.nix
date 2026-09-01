@@ -2,12 +2,8 @@
 
 ## Hermetic build of the FFI shared library + generated C header.
 ##
-## Mirrors vacp2p/nim-libp2p `nix/cbind.nix` but tailored to
-## nim_libp2p_mix_rln_ffi.nimble's dep set and a mandatory `librln.a` input.
-##
-## Deps are declared by `cbind-deps.nix`. That file is a stub in this scaffold
-## — its `sha256` values are placeholders. Regenerate them with `nix-prefetch-git`
-## against the pinned SHAs before this derivation will evaluate.
+## Uses the exact dependency graph from the pinned Delivery revision plus the
+## Delivery source itself and a mandatory `librln.a` input.
 ##
 ## `librln`: path to the librln.a static archive from vacp2p/zerokit. Passed in
 ## from the flake so packaging zerokit stays out of scope here.

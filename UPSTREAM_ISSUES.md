@@ -275,6 +275,10 @@ possible to ship anything spec-compliant until the following are pinned:
   exposes `setPublishCallback(topic, data)` and expects the host to route
   it, but the spec doesn't say what module/channel the host should use.
 
+The transport wiring is resolved for this facade by logos-delivery PR #4182:
+Delivery publishes and consumes these frames on Relay without a host-side
+forwarding bus. The deployment identifiers above still need specification.
+
 Our current scaffold carries placeholder defaults for every knob above
 (with a README warning that these MUST be pinned before mainnet use), so we
 can iterate on shape while the values are settled — but they need real

@@ -1,5 +1,5 @@
 {
-  description = "C FFI facade for nim-libp2p + nim-libp2p-mix + mix-rln-spam-protection-plugin";
+  description = "C FFI facade for Delivery + Mix + Mix-RLN";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
@@ -52,8 +52,8 @@
           cbind = cbindPkg;
 
           # `smoketest-3node-ffi`: builds AND runs tests/smoketest_3node_ffi.c
-          # against the cbind output. Passing build = 3-node end-to-end mix
-          # delivery through the C API works.
+          # against the cbind output. Passing build = Delivery Relay
+          # coordination and Mix-RLN routing through the C API work.
           smoketest-3node-ffi = import ./nix/smoketest-3node-ffi.nix {
             inherit pkgs;
             src = ./.;
