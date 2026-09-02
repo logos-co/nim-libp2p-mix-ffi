@@ -1,8 +1,9 @@
 # nim-libp2p-mix-rln-ffi
 
-C FFI facade composing [nim-libp2p][libp2p] + [nim-libp2p-mix][mix] +
-[mix-rln-spam-protection-plugin][mix-rln] (aka `nim-libp2p-mix-rln`, the
-RLN spam-protection Nim library). Produces `liblibp2p_mix_rln.{so,dylib,dll}`
+C FFI facade composing [Logos Delivery][delivery] + [nim-libp2p-mix][mix] +
+[mix-rln-spam-protection-plugin][mix-rln]. Delivery owns the single libp2p
+node used by Relay, Mix, and RLN coordination. Produces
+`liblibp2p_mix_rln.{so,dylib,dll}`
 and `libp2p_mix_rln.h` for consumption by [logos-libp2p-mix-rln][logos-mod]'s
 C++/Qt Logos Core module.
 
@@ -14,8 +15,9 @@ for pragma-driven codegen of the C header.
 FFI validated end-to-end at runtime:
 
 - Standalone C smoke test: `nim-libp2p-mix-rln-ffi-smoketest-3node-ffi`
-  drives 3 nodes purely through the C API, pings across a Sphinx circuit,
-  round-trips per-hop RLN proofs.
+  drives 5 nodes purely through the C API, synchronizes membership over
+  Delivery Relay, pings across a Sphinx circuit, and round-trips per-hop RLN
+  proofs.
 - Nim integration test: `test_mix_routing_rln` — same but composed
   in-process, useful for iterating on the composition.
 - Multi-node e2e through the C++ Logos Core module — see
@@ -39,7 +41,7 @@ for merge; see the PR for why) so no override is needed. Repoint to
 ```sh
 nix run .#test-mix-routing         # 5-node Sphinx circuit (no RLN)
 nix run .#test-mix-routing-rln     # same, with per-hop RLN
-nix run .#smoketest-3node-ffi      # C-level 3-node ping through FFI
+nix run .#smoketest-3node-ffi      # C-level 5-node Delivery/Relay/Mix/RLN test
 ```
 
 ## What's real vs. stubbed
@@ -50,10 +52,11 @@ Real, exercised at runtime:
 - `sendMixMessageToExit` — exit-is-dest routing, no exit multiaddr needed.
 - `registerRlnMembership` / `hasRlnMembership`.
 - `getNodeInfo(Version | PeerId | Multiaddrs | MixPublicKey)`.
-- Multi-node topology: `getLocalMixPeerRecord`, `addMixPeer`,
-  `mountReceiver`, `deliverCoordFrame` for shell-driven RLN coord sync.
+- Multi-node topology: `getLocalMixPeerRecord`, `addMixPeer`, and
+  `mountReceiver`; RLN coordination propagates through Delivery Relay.
 - Events (via `nim-ffi`'s `{.ffiEvent.}`): `onIncomingMixMessage`,
-  `onRlnMembershipRegistered`, `onRlnPublishRequested`.
+  `onRlnMembershipRegistered`. The existing `onRlnPublishRequested` and
+  `deliverCoordFrame` symbols remain available for ABI compatibility.
 
 Stubbed (returns `err("not implemented")`):
 - `libp2pMixRlnSendMixSurbReply` — needs the mix reply-store lookup wired.
@@ -97,13 +100,12 @@ nim c -d:libp2p_mix_experimental_exit_is_dest \
       libp2p_mix_rln.nim
 ```
 
-On this machine, `nimble -l setup` currently fails building `testutils`
-against nimble's freshly-downloaded copy of nim 2.2.10 (stdlib/compiler
-mismatch — likely a nimble bug). If you hit it, delete
-`nimbledeps/pkgs2/nim-*` and let subsequent `nimble develop` calls use the
-system nim. The nix path avoids this entirely.
+Nimble 0.24.1 currently fails to solve Delivery's full dependency graph even
+with the checked-in lockfile. The hermetic Nix build uses the same exact pins
+without invoking that solver.
 
 [libp2p]: https://github.com/vacp2p/nim-libp2p
+[delivery]: https://github.com/logos-messaging/logos-delivery/pull/4185
 [mix]: https://github.com/logos-co/nim-libp2p-mix
 [mix-rln]: https://github.com/logos-co/mix-rln-spam-protection-plugin
 [logos-mod]: https://github.com/logos-co/logos-libp2p-mix-rln

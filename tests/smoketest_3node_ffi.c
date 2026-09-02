@@ -1,6 +1,6 @@
-// 3-node end-to-end smoke test driven entirely through the C FFI.
+// 5-node end-to-end smoke test driven entirely through the C FFI.
 //
-// Spins up three LibMixRln contexts in one process, cross-registers their
+// Spins up five LibMixRln contexts in one process, cross-registers their
 // mix peer records so each node's Sphinx path selector knows the others,
 // mounts a `/logosmix/test/echo/1.0.0` receiver on node C, and calls
 // `sendMixMessage(destPeerId=C, proto=/logosmix/test/echo/1.0.0,
@@ -23,6 +23,7 @@ extern void liblibp2p_mix_rlnNimMain(void);
 
 static const char* kTestCodec = "/logosmix/test/echo/1.0.0";
 static const char* kTestPayload = "hello mix";
+static const char* kReplyPayload = "hello back";
 
 // -------- generic sync-over-async waiter ----------------------------------
 
@@ -37,6 +38,11 @@ typedef struct {
     int             rec_valid;
     bool            reply_bool;
     int             reply_bool_valid;
+    uint8_t         reply_bytes[4096];
+    size_t          reply_bytes_len;
+    char            reply_string[512];
+    double          reply_rate;
+    int64_t         reply_index;
 } Waiter;
 
 static void waiter_init(Waiter* w) {
@@ -49,6 +55,10 @@ static void waiter_init(Waiter* w) {
     w->rec_valid = 0;
     w->reply_bool = false;
     w->reply_bool_valid = 0;
+    w->reply_bytes_len = 0;
+    w->reply_string[0] = '\0';
+    w->reply_rate = 0.0;
+    w->reply_index = -1;
 }
 
 static void waiter_signal(Waiter* w) {
@@ -90,12 +100,38 @@ static void on_bool(int ec, const bool* reply, const char* em, void* ud) {
 static void on_mix_send(int ec, const MixSendResponse* r, const char* em, void* ud) {
     Waiter* w = (Waiter*)ud;
     w->err_code = ec;
-    if (r) { w->reply_bool = r->ok; w->reply_bool_valid = 1; }
+    if (r) {
+        w->reply_bool = r->ok;
+        w->reply_bool_valid = 1;
+        w->reply_bytes_len = r->reply.len < sizeof(w->reply_bytes)
+                             ? r->reply.len : sizeof(w->reply_bytes);
+        memcpy(w->reply_bytes, r->reply.data, w->reply_bytes_len);
+    }
     if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
     waiter_signal(w);
 }
 
 // Deep-copies the reply into the waiter — the reply memory is owned by the
+
+static void on_node_info(int ec, const NodeInfoResponse* r,
+                         const char* em, void* ud) {
+    Waiter* w = (Waiter*)ud;
+    w->err_code = ec;
+    if (r)
+        snprintf(w->reply_string, sizeof(w->reply_string), "%.*s",
+                 (int)r->value.len, r->value.data);
+    if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
+    waiter_signal(w);
+}
+
+static void on_cover_rate(int ec, const CoverRateResponse* r,
+                          const char* em, void* ud) {
+    Waiter* w = (Waiter*)ud;
+    w->err_code = ec;
+    if (r) w->reply_rate = r->rate;
+    if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
+    waiter_signal(w);
+}
 // binding and freed after this callback returns.
 static void on_peer_record(int ec, const MixPeerRecord* r,
                            const char* em, void* ud) {
@@ -140,10 +176,25 @@ typedef struct {
     uint8_t         payload[4096];
     size_t          payload_len;
     char            proto[128];
+    LibMixRlnCtx*   ctx;
+    atomic_int      reply_completed;
+    atomic_int      reply_ok;
+    char            reply_err[512];
 } InboxSlot;
+
+static void on_surb_reply(int ec, const bool* reply, const char* em, void* ud) {
+    InboxSlot* s = (InboxSlot*)ud;
+    if (em) snprintf(s->reply_err, sizeof(s->reply_err), "%s", em);
+    fprintf(stderr, "[smoke] SURB send completed: ec=%d ok=%d msg='%s'\n",
+            ec, reply && *reply, em ? em : "");
+    atomic_store(&s->reply_ok, ec == 0 && reply && *reply);
+    atomic_store(&s->reply_completed, 1);
+}
 
 static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     InboxSlot* s = (InboxSlot*)ud;
+    fprintf(stderr, "[smoke] incoming request reached destination; surb_len=%zu\n",
+            evt->surb.len);
     pthread_mutex_lock(&s->m);
     size_t plen = evt->payload.len < sizeof(s->payload) - 1
                   ? evt->payload.len : sizeof(s->payload) - 1;
@@ -156,22 +207,33 @@ static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     atomic_store(&s->fired, 1);
     pthread_cond_signal(&s->c);
     pthread_mutex_unlock(&s->m);
+    if (evt->surb.len == 0) {
+        snprintf(s->reply_err, sizeof(s->reply_err), "incoming event had no SURB");
+        atomic_store(&s->reply_completed, 1);
+        return;
+    }
+    MixSurbReplyRequest req;
+    memset(&req, 0, sizeof(req));
+    req.surb = evt->surb;
+    req.payload.data = (uint8_t*)kReplyPayload;
+    req.payload.len = strlen(kReplyPayload);
+    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(s->ctx, &req, on_surb_reply, s);
 }
 
 // -------- node builder ----------------------------------------------------
 
-static LibMixRlnCtx* make_node(const char* listen_multiaddr) {
+static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transport) {
     NimFfiStr addr = nimffi_str(listen_multiaddr);
     MixRlnConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.addrs.data = &addr;
     cfg.addrs.len = 1;
-    cfg.transport = nimffi_str("tcp");
+    cfg.transport = nimffi_str(transport);
     cfg.maxConnections = 50;
     cfg.maxInConnections = 25;
     cfg.maxOutConnections = 25;
     cfg.maxConnsPerPeer = 1;
-    cfg.mix.coverRateFraction = 0.7;
+    cfg.mix.coverRateFraction = 0.01;
     cfg.rln.epochDurationSeconds = 1;
     cfg.rln.period = 1;
     cfg.rln.messagingRate = 10;
@@ -241,104 +303,20 @@ static int stop_node(LibMixRlnCtx* ctx) {
     return 0;
 }
 
-// -------- RLN coord bus ---------------------------------------------------
-//
-// In production, an RLN publish_requested event goes out on RLN Relay and is
-// re-delivered to every other node's plugin via the coord channel. For this
-// in-process test we bridge synchronously: onRlnPublishRequested captures the
-// frame, and after each origin op we drain the queue into every other node's
-// `libp2pMixRlnDeliverCoordFrame`.
-
-typedef struct {
-    uint8_t*    data;
-    size_t      len;
-    char*       topic;
-} CoordFrame;
-
-typedef struct {
-    pthread_mutex_t m;
-    CoordFrame*     frames;
-    size_t          count;
-    size_t          cap;
-} CoordBus;
-
-static CoordBus g_bus;
-
-static void bus_init(void) {
-    pthread_mutex_init(&g_bus.m, NULL);
-    g_bus.frames = NULL; g_bus.count = 0; g_bus.cap = 0;
-}
-
-static void bus_push(const char* topic, size_t topic_len,
-                     const uint8_t* data, size_t data_len) {
-    pthread_mutex_lock(&g_bus.m);
-    if (g_bus.count == g_bus.cap) {
-        g_bus.cap = g_bus.cap ? g_bus.cap * 2 : 8;
-        g_bus.frames = realloc(g_bus.frames, g_bus.cap * sizeof(CoordFrame));
-    }
-    CoordFrame* f = &g_bus.frames[g_bus.count++];
-    f->topic = strndup(topic, topic_len);
-    f->data = malloc(data_len);
-    memcpy(f->data, data, data_len);
-    f->len = data_len;
-    pthread_mutex_unlock(&g_bus.m);
-}
-
-static void bus_clear(void) {
-    pthread_mutex_lock(&g_bus.m);
-    for (size_t i = 0; i < g_bus.count; i++) {
-        free(g_bus.frames[i].topic);
-        free(g_bus.frames[i].data);
-    }
-    g_bus.count = 0;
-    pthread_mutex_unlock(&g_bus.m);
-}
-
-static void on_rln_publish(const RlnPublishRequestedEvent* evt, void* ud) {
-    (void)ud;
-    if (!evt) return;
-    bus_push(evt->contentTopic.data, evt->contentTopic.len,
-             evt->payload.data, evt->payload.len);
-}
-
-// Delivers every buffered frame to every ctx in `nodes` (skipping self is
-// harmless — plugin.handleMembershipUpdate is idempotent). Clears the bus.
-static int drain_bus_to_all(LibMixRlnCtx** nodes, int n) {
-    pthread_mutex_lock(&g_bus.m);
-    size_t count = g_bus.count;
-    CoordFrame* frames = g_bus.frames;
-    for (size_t i = 0; i < count; i++) {
-        RlnCoordFrame req;
-        memset(&req, 0, sizeof(req));
-        req.contentTopic = nimffi_str(frames[i].topic);
-        req.data.data = frames[i].data;
-        req.data.len  = frames[i].len;
-        for (int k = 0; k < n; k++) {
-            Waiter w; waiter_init(&w);
-            (void)libp2p_mix_rln_ctx_deliver_coord_frame(nodes[k], &req, on_bool, &w);
-            if (waiter_wait(&w, 10) != 0) {
-                fprintf(stderr, "deliver_coord_frame TIMEOUT on node %d\n", k);
-                pthread_mutex_unlock(&g_bus.m);
-                return -1;
-            }
-            // Non-zero err_code is fine when the plugin already knows the frame.
-        }
-    }
-    pthread_mutex_unlock(&g_bus.m);
-    bus_clear();
-    return 0;
-}
-
 static void on_membership(int ec, const RlnMembershipStatus* r,
                           const char* em, void* ud) {
     Waiter* w = (Waiter*)ud;
     w->err_code = ec;
-    if (r) { w->reply_bool = r->registered; w->reply_bool_valid = 1; }
+    if (r) {
+        w->reply_bool = r->registered;
+        w->reply_bool_valid = 1;
+        w->reply_index = r->index;
+    }
     if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
     waiter_signal(w);
 }
 
-static int register_membership(LibMixRlnCtx* ctx, int idx) {
+static int64_t register_membership(LibMixRlnCtx* ctx, int idx) {
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_register_rln_membership(ctx, on_membership, &w);
     if (waiter_wait(&w, 30) != 0 || w.err_code != 0) {
@@ -346,6 +324,36 @@ static int register_membership(LibMixRlnCtx* ctx, int idx) {
                 idx, w.err_code, w.err_msg);
         return -1;
     }
+    return w.reply_index;
+}
+
+static int get_membership_index(LibMixRlnCtx* ctx, int64_t* out) {
+    Waiter w; waiter_init(&w);
+    NodeInfoRequest req;
+    memset(&req, 0, sizeof(req));
+    req.field = NODE_INFO_FIELD_NIF_RLN_MEMBERSHIP_INDEX;
+    (void)libp2p_mix_rln_ctx_get_node_info(ctx, &req, on_node_info, &w);
+    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
+    char* end = NULL;
+    long long value = strtoll(w.reply_string, &end, 10);
+    if (!end || *end != '\0') return -1;
+    *out = (int64_t)value;
+    return 0;
+}
+
+static int get_cover_rate(LibMixRlnCtx* ctx, double* out) {
+    Waiter w; waiter_init(&w);
+    (void)libp2p_mix_rln_ctx_get_cover_traffic_rate(ctx, on_cover_rate, &w);
+    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
+    *out = w.reply_rate;
+    return 0;
+}
+
+static int set_cover_rate(LibMixRlnCtx* ctx, double rate) {
+    SetCoverRateRequest req = { .rate = rate };
+    Waiter w; waiter_init(&w);
+    (void)libp2p_mix_rln_ctx_set_cover_traffic_rate(ctx, &req, on_bool, &w);
+    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
     return 0;
 }
 
@@ -358,10 +366,15 @@ int main(void) {
     // (excluding self + destination). 5 total nodes gives the selector real
     // choice per Sphinx path.
     enum { N = 5 };
+    const char* transport = getenv("MIX_TEST_TRANSPORT");
+    if (!transport || transport[0] == '\0') transport = "tcp";
+    const char* listen_multiaddr = strcmp(transport, "quic") == 0
+        ? "/ip4/127.0.0.1/udp/0/quic-v1" : "/ip4/127.0.0.1/tcp/0";
+    fprintf(stderr, "[smoke] transport=%s\n", transport);
     LibMixRlnCtx* nodes[N];
     MixPeerRecord recs[N];
     for (int i = 0; i < N; i++) {
-        nodes[i] = make_node("/ip4/127.0.0.1/tcp/0");
+        nodes[i] = make_node(listen_multiaddr, transport);
         if (!nodes[i]) { fprintf(stderr, "node[%d] create failed\n", i); return 1; }
     }
     fprintf(stderr, "[smoke] %d nodes created\n", N);
@@ -373,6 +386,22 @@ int main(void) {
     for (int i = 0; i < N; i++)
         if (start_node(nodes[i])) { fprintf(stderr, "start[%d] failed\n", i); return 1; }
     fprintf(stderr, "[smoke] all %d nodes started\n", N);
+
+    double cover_rate = 0.0;
+    if (get_cover_rate(nodes[0], &cover_rate) || cover_rate < 0.0099 || cover_rate > 0.0101) {
+        fprintf(stderr, "initial cover rate mismatch: %.6f\n", cover_rate);
+        return 1;
+    }
+    if (set_cover_rate(nodes[0], 0.02)) {
+        fprintf(stderr, "set_cover_rate failed\n");
+        return 1;
+    }
+    if (get_cover_rate(nodes[0], &cover_rate) || cover_rate < 0.0199 || cover_rate > 0.0201) {
+        fprintf(stderr, "updated cover rate mismatch: %.6f\n", cover_rate);
+        return 1;
+    }
+    fprintf(stderr, "[smoke] live cover rate updated to %.2f\n", cover_rate);
+
 
     // Fetch each node's public record so we can cross-register.
     for (int i = 0; i < N; i++)
@@ -395,21 +424,26 @@ int main(void) {
     LibMixRlnCtx* C = nodes[N - 1];  // exit / destination
     MixPeerRecord* recC = &recs[N - 1];
 
-    // Bridge the RLN coord bus: subscribe every node's onRlnPublishRequested
-    // to a shared queue, then after every registerSelf drain the queue into
-    // every node's DeliverCoordFrame. Without this, each plugin's Merkle
-    // tree only has its OWN commitment, verification along the mix path
-    // fails, and the exit rejects the packet.
-    bus_init();
-    for (int i = 0; i < N; i++)
-        (void)libp2p_mix_rln_ctx_add_on_rln_publish_requested_listener(
-            nodes[i], on_rln_publish, NULL);
-
+    // Membership updates propagate over Delivery Relay. Registrations remain
+    // sequential until distributed member-index allocation is implemented.
+    int64_t membership_indices[N];
+    struct timespec membership_settle = { .tv_sec = 1, .tv_nsec = 0 };
     for (int i = 0; i < N; i++) {
-        if (register_membership(nodes[i], i)) return 1;
-        if (drain_bus_to_all(nodes, N)) return 1;
+        membership_indices[i] = register_membership(nodes[i], i);
+        if (membership_indices[i] < 0) return 1;
+        nanosleep(&membership_settle, NULL);
     }
-    fprintf(stderr, "[smoke] all RLN memberships registered and synced\n");
+    struct timespec relay_settle = { .tv_sec = 2, .tv_nsec = 0 };
+    nanosleep(&relay_settle, NULL);
+    for (int i = 0; i < N; i++) {
+        int64_t looked_up = -1;
+        if (get_membership_index(nodes[i], &looked_up) ||
+            looked_up != membership_indices[i]) {
+            fprintf(stderr, "membership index lookup mismatch on node %d\n", i);
+            return 1;
+        }
+    }
+    fprintf(stderr, "[smoke] all RLN memberships registered over Delivery Relay\n");
 
     // Mount receiver on C.
     MountReceiverRequest mreq;
@@ -428,6 +462,9 @@ int main(void) {
     pthread_mutex_init(&inbox.m, NULL);
     pthread_cond_init(&inbox.c, NULL);
     atomic_store(&inbox.fired, 0);
+    inbox.ctx = C;
+    atomic_store(&inbox.reply_completed, 0);
+    atomic_store(&inbox.reply_ok, 0);
     (void)libp2p_mix_rln_ctx_add_on_incoming_mix_message_listener(
         C, on_incoming, &inbox);
     fprintf(stderr, "[smoke] mounted receiver + event listener on C\n");
@@ -440,8 +477,8 @@ int main(void) {
     sr.proto         = nimffi_str(kTestCodec);
     sr.payload.data  = (uint8_t*)kTestPayload;
     sr.payload.len   = strlen(kTestPayload);
-    sr.expectReply   = false;
-    sr.numSurbs      = 0;
+    sr.expectReply   = true;
+    sr.numSurbs      = 1;
     sr.timeoutMs     = 15000;
     sr.isExitDest    = true;
 
@@ -451,6 +488,17 @@ int main(void) {
     if (waiter_wait(&sw, 30) != 0 || sw.err_code != 0) {
         fprintf(stderr, "send_mix_message failed: %s\n", sw.err_msg); return 1;
     }
+    if (!atomic_load(&inbox.reply_completed) || !atomic_load(&inbox.reply_ok)) {
+        fprintf(stderr, "SURB reply send failed: %s\n", inbox.reply_err);
+        return 1;
+    }
+    if (sw.reply_bytes_len != strlen(kReplyPayload) ||
+        memcmp(sw.reply_bytes, kReplyPayload, sw.reply_bytes_len) != 0) {
+        fprintf(stderr, "SURB reply payload mismatch\n");
+        return 1;
+    }
+    fprintf(stderr, "[smoke] SURB reply received by sender\n");
+
     fprintf(stderr, "[smoke] send returned OK; waiting for delivery event on C...\n");
 
     // Wait for C's inbox to fire.
@@ -476,7 +524,7 @@ int main(void) {
              (memcmp(inbox.payload, kTestPayload, inbox.payload_len) == 0) &&
              (strcmp(inbox.proto, kTestCodec) == 0);
     if (!ok) { fprintf(stderr, "PAYLOAD MISMATCH\n"); return 3; }
-    fprintf(stderr, "[smoke] PASS: payload delivered end-to-end\n");
+    fprintf(stderr, "[smoke] PASS: request and SURB reply delivered end-to-end\n");
 
     // Cleanup.
     for (int i = 0; i < N; i++) (void)stop_node(nodes[i]);

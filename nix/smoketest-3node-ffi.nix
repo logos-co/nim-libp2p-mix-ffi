@@ -31,8 +31,9 @@ pkgs.stdenv.mkDerivation {
 
   installPhase = ''
     mkdir -p $out
-    ./smoketest_3node_ffi 2>&1 | tee $out/log
+    MIX_TEST_TRANSPORT=tcp ./smoketest_3node_ffi 2>&1 | tee $out/tcp.log
+    MIX_TEST_TRANSPORT=quic ./smoketest_3node_ffi 2>&1 | tee $out/quic.log
     cp smoketest_3node_ffi $out/
-    echo "== PASS ==" | tee -a $out/log
+    echo "== TCP + QUIC PASS =="
   '';
 }

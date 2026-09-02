@@ -3,18 +3,15 @@ mode = ScriptMode.Verbose
 packageName = "nim_libp2p_mix_rln_ffi"
 version     = "0.1.0"
 author      = "Logos"
-description = "C FFI facade composing nim-libp2p, nim-libp2p-mix, and mix-rln-spam-protection-plugin. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
+description = "C FFI facade composing Logos Delivery, nim-libp2p-mix, and Mix-RLN. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
 license     = "MIT OR Apache-2.0"
 
 # Direct deps ---------------------------------------------------------------
-# `mix_rln_spam_protection` transitively pins `libp2p == 2.1.4` and
-# `nim-libp2p-mix#c387ca67cf477dc53ec6228027c45d8eda067917`; that pin
-# collapses the diamond dep for us — do NOT also require a different
-# libp2p / nim-libp2p-mix version here.
-# nim-ffi at the pinned SHA requires nim >= 2.2.6; nim-libp2p/cbind's
-# lockfile pins nim to 2.2.10.
+# Delivery owns the libp2p node and transitively pins libp2p, nim-libp2p-mix,
+# and the Mix-RLN plugin to one compatible dependency graph.
+# nim-ffi at the pinned SHA requires nim >= 2.2.6.
 requires "nim >= 2.2.6"
-requires "chronos >= 4.2.2"
+requires "chronos == 4.2.5"
 requires "chronicles >= 0.11.0"
 requires "results >= 0.4.0"
 requires "stew >= 0.4.2"
@@ -22,16 +19,12 @@ requires "metrics"
 requires "nimcrypto >= 0.6.0"
 requires "taskpools >= 0.1.0"
 
-# nim-ffi: pragmas + codegen for the C header. Pinned to current master head.
-# (nim-libp2p/cbind's pin `b95e2b04…` is on an unmerged branch
-# `fix/cbor-non-canonical` and nimble's shallow-clone-of-master strategy can't
-# resolve it; that fix is present on master as squashed commit `83f1aae`.)
-requires "https://github.com/logos-messaging/nim-ffi#b6c17dc822960b626d76d814de90208c0a40a44e"
-requires "https://github.com/vacp2p/nim-cbor-serialization#1664160e04d153573373afddc552b9cbf6fbe4dc"
+# Match Delivery's nim-ffi/CBOR toolchain to avoid a second serialization graph.
+requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
-# The RLN plugin drags libp2p 2.1.4 + libp2p_mix into scope; that's the
-# entire composition target for this facade.
-requires "https://github.com/logos-co/mix-rln-spam-protection-plugin.git#135182b72c16d3bd9c2d06087d84303272e4d1eb"
+# Exact head of logos-delivery PR #4185. Keep this immutable while the stacked
+# Delivery integration PRs are awaiting merge.
+requires "https://github.com/logos-messaging/logos-delivery.git#8a254b7e136bf5ce9660ebf746f2ebe69bd54bd7"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:
