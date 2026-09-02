@@ -24,7 +24,7 @@ requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457
 
 # Exact head of logos-delivery PR #4185. Keep this immutable while the stacked
 # Delivery integration PRs are awaiting merge.
-requires "https://github.com/logos-messaging/logos-delivery.git#a00aba618890397ef40d1a16b22b094d8afd0a62"
+requires "https://github.com/logos-messaging/logos-delivery.git#8a254b7e136bf5ce9660ebf746f2ebe69bd54bd7"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:

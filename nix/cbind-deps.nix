@@ -143,9 +143,9 @@
   };
 
   libp2p_mix = pkgs.fetchgit {
-    url = "https://github.com/logos-co/nim-libp2p-mix";
-    rev = "39d2ac78da7b7f33562eb7cd95d6280ca9fa0e94";
-    sha256 = "098db702wviph33mzvlj4b20cpj10csfya2yx80rwlppc2brxqc4";
+    url = "https://github.com/richard-ramos/nim-libp2p-mix";
+    rev = "75f8bd5386f08ea909332774ddbeb78599b89d92";
+    sha256 = "1l7yy9ihm1zcrw0bvg8qy6d44s8lkjxbxb1vbc4pryc7jkxryw9h";
     fetchSubmodules = true;
   };
 
@@ -158,8 +158,8 @@
 
   logos_delivery = pkgs.fetchgit {
     url = "https://github.com/logos-messaging/logos-delivery.git";
-    rev = "a00aba618890397ef40d1a16b22b094d8afd0a62";
-    sha256 = "0qd1g7zr8b93lisqrqaym7gcxb95mwgbj133z5kll5z25zjnfrj0";
+    rev = "8a254b7e136bf5ce9660ebf746f2ebe69bd54bd7";
+    sha256 = "1xpm2vfyj8bgj6klv1sl2ylxg31gsv09qz7gddmnrll74kd9wrg5";
     fetchSubmodules = true;
   };
 
@@ -186,8 +186,8 @@
 
   mix_rln_spam_protection = pkgs.fetchgit {
     url = "https://github.com/logos-co/mix-rln-spam-protection-plugin";
-    rev = "7e9bbc1c231e025a17dd0dd8ce6a4457e34ac333";
-    sha256 = "01dggifhxbl93mqgyjhnfc6d28l2iskh3zxlsllgjrrd6gfd9pla";
+    rev = "2dee9aaa2214895805fded977543c2770db4dc16";
+    sha256 = "0d0k2k95zrlm4bw2cjnxcc63zgwvkz6hlycj31v1h4syd3a2brzk";
     fetchSubmodules = true;
   };
 

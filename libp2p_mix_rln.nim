@@ -12,7 +12,7 @@
 ##
 ## Delivery owns the node lifecycle, Relay coordination, and the switch used by
 ## Mix. `{.ffiEvent.}` bridges expose incoming mix messages and registration.
-## SURB reply, RLN membership index, MixPublicKey introspection still stubbed.
+## Service-discovery-backed peer listing remains a placeholder.
 
 import ffi
 
@@ -22,7 +22,7 @@ import chronicles
 import results
 
 # Delivery owns the only libp2p switch used by this facade.
-import libp2p/[multiaddress, peerid, switch]
+import libp2p/[multiaddress, peerid, switch, varint]
 import libp2p/crypto/[crypto, secp]
 import libp2p/crypto/curve25519 as lp_curve25519
 import libp2p/protocols/connectivity/relay/relay as circuit_relay
@@ -30,7 +30,11 @@ import libp2p/stream/[connection, lpstream]
 
 # nim-libp2p-mix — Sphinx routing + mix protocol.
 import libp2p_mix
-import libp2p_mix/[mix_protocol, mix_node, curve25519, pool]
+import
+  libp2p_mix/[
+    mix_protocol, mix_node, curve25519, pool, cover_traffic, exit_connection,
+    serialization,
+  ]
 
 # Receiver-side helpers: mounting a plain LPProtocol on the exit switch so
 # `exit_is_dest` mode can dispatch the payload into a host-visible handler.
@@ -54,9 +58,10 @@ type LibMixRln* = ref object
   ## / `libp2pMixRlnDestroy`.
   node: WakuNode
   mixProto: MixProtocol
+  coverTraffic: ConstantRateCoverTraffic
   rlnPlugin: MixRlnSpamProtection
   mixPubKey: seq[byte]
-  coverRateFraction: float64
+  transport: string
   running: bool
   stopped: bool
 
@@ -87,12 +92,13 @@ type NodeInfoResponse {.ffi.} = object
   value: string ## For Multiaddrs, a comma-joined list (parse on the host side).
 
 type MixSendRequest {.ffi.} = object
-  destPeerId: string     ## Multibase-encoded libp2p peer id of the exit destination.
-  destMultiaddr: string  ## One routable multiaddr of the destination. Ignored when isExitDest=true.
-  proto: string          ## The libp2p protocol id the destination will accept the payload on.
+  destPeerId: string ## Multibase-encoded libp2p peer id of the exit destination.
+  destMultiaddr: string
+    ## One routable multiaddr of the destination. Ignored when isExitDest=true.
+  proto: string ## The libp2p protocol id the destination will accept the payload on.
   payload: seq[byte]
-  expectReply: bool      ## If true, includes a single-use SURB for a reply.
-  numSurbs: int64        ## Non-zero only when expectReply=true; LIP LOGOS-MIXNET expects 1.
+  expectReply: bool ## If true, includes a single-use SURB for a reply.
+  numSurbs: int64 ## Non-zero only when expectReply=true; LIP LOGOS-MIXNET expects 1.
   timeoutMs: int64
   isExitDest: bool
     ## If true, address the exit as the destination (uses
@@ -109,8 +115,8 @@ type MixPeerRecord {.ffi.} = object
   ## and hand to `libp2pMixRlnAddMixPeer` on other nodes.
   peerId: string
   multiaddrs: seq[string]
-  mixPubKey: seq[byte]     ## 32 bytes (Curve25519 pub).
-  libp2pPubKeyHex: string  ## Hex-encoded raw Secp256k1 pub bytes (33 bytes).
+  mixPubKey: seq[byte] ## 32 bytes (Curve25519 pub).
+  libp2pPubKeyHex: string ## Hex-encoded raw Secp256k1 pub bytes (33 bytes).
 
 type MountReceiverRequest {.ffi.} = object
   ## Mounts a plain LPProtocol on the local switch under `codec`. Bytes arriving
@@ -123,8 +129,10 @@ type MountReceiverRequest {.ffi.} = object
 type MixSendResponse {.ffi.} = object
   ok: bool
 
+  reply: seq[byte] ## Empty unless expectReply=true and a reply was received.
+
 type MixSurbReplyRequest {.ffi.} = object
-  surb: seq[byte]
+  surb: seq[byte] ## Raw SURB bytes from IncomingMixMessageEvent.surb.
   payload: seq[byte]
 
 type CoverRateResponse {.ffi.} = object
@@ -150,7 +158,7 @@ type RlnMembershipStatus {.ffi.} = object
 type IncomingMixMessageEvent {.ffi.} = object
   proto: string
   payload: seq[byte]
-  surb: seq[byte]      ## Empty when the sender did not include one.
+  surb: seq[byte] ## Raw SURB bytes; empty when the sender did not include one.
 
 type RlnMembershipRegisteredEvent {.ffi.} = object
   index: int64
@@ -162,30 +170,29 @@ type RlnPublishRequestedEvent {.ffi.} = object
   payload: seq[byte]
 
 proc onIncomingMixMessage*(event: IncomingMixMessageEvent) {.ffiEvent.} =
-  ## Fired when a mounted mix-destination protocol receives a message.
-  ## Not yet wired — will fire from the exit-layer read handler once destination
-  ## protocols are registered from the host.
+  ## Fired when a mounted mix-destination protocol receives a message. Pass a
+  ## non-empty `event.surb` to `libp2pMixRlnSendMixSurbReply` to reply.
 
-proc onRlnMembershipRegistered*(
-    event: RlnMembershipRegisteredEvent
-) {.ffiEvent.} =
+proc onRlnMembershipRegistered*(event: RlnMembershipRegisteredEvent) {.ffiEvent.} =
   ## Fired after `libp2pMixRlnRegisterRlnMembership` succeeds.
 
 proc onRlnPublishRequested*(event: RlnPublishRequestedEvent) {.ffiEvent.} =
   ## Retained for C ABI compatibility. Delivery now publishes coordination
   ## frames directly through Relay, so new hosts should not subscribe to it.
+  # ----------------------------------------------------------------------------
+  # Config helpers
+  # ----------------------------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-# Config helpers
-# ----------------------------------------------------------------------------
+proc listenEndpoint(ma: string, transport: string): Result[(IpAddress, Port), string] =
+  let expectedProtocol = if transport == "quic": "udp" else: "tcp"
+  if transport == "quic" and not ma.endsWith("/quic-v1"):
+    return err("QUIC listen multiaddr must end with /quic-v1: " & ma)
 
-proc listenEndpoint(ma: string): Result[(IpAddress, Port), string] =
-  ## Delivery's factory currently exposes IP + TCP listen configuration.
   let parts = ma.split('/')
   var address = static parseIpAddress("0.0.0.0")
   var port = Port(0)
   var foundAddress = false
-  var foundTcp = false
+  var foundTransport = false
   var i = 1
   while i + 1 < parts.len:
     case parts[i]
@@ -195,20 +202,24 @@ proc listenEndpoint(ma: string): Result[(IpAddress, Port), string] =
         foundAddress = true
       except ValueError:
         return err("invalid listen IP address: " & parts[i + 1])
-    of "tcp":
+    of "tcp", "udp":
       try:
-        let value = parseInt(parts[i + 1])
-        if value < 0 or value > high(uint16).int:
-          return err("listen TCP port is out of range: " & parts[i + 1])
-        port = Port(value)
-        foundTcp = true
+        if parts[i] == expectedProtocol:
+          let value = parseInt(parts[i + 1])
+          if value < 0 or value > high(uint16).int:
+            return err("listen port is out of range: " & parts[i + 1])
+          port = Port(value)
+          foundTransport = true
       except ValueError:
-        return err("invalid listen TCP port: " & parts[i + 1])
+        return err("invalid listen port: " & parts[i + 1])
     else:
       discard
     i += 2
-  if not foundAddress or not foundTcp:
-    return err("listen multiaddr must contain an IP address and TCP port: " & ma)
+  if not foundAddress or not foundTransport:
+    return err(
+      "listen multiaddr must contain an IP address and " & expectedProtocol & " port: " &
+        ma
+    )
   ok((address, port))
 
 proc decodeHexPrivKey(hex: string, rng: Rng): SkPrivateKey {.raises: [].} =
@@ -221,7 +232,7 @@ proc decodeHexPrivKey(hex: string, rng: Rng): SkPrivateKey {.raises: [].} =
     var raw = newSeq[byte](hex.len div 2)
     let start = if hex.startsWith("0x") or hex.startsWith("0X"): 2 else: 0
     for i in 0 ..< (hex.len - start) div 2:
-      raw[i] = byte(parseHexInt(hex[start + 2*i .. start + 2*i + 1]))
+      raw[i] = byte(parseHexInt(hex[start + 2 * i .. start + 2 * i + 1]))
     let sk = SkPrivateKey.init(raw)
     if sk.isOk:
       return sk.value
@@ -251,15 +262,20 @@ proc buildRlnConfig(cfg: MixRlnConfig): mix_rln.MixRlnConfig =
   rlnCfg
 
 proc buildDeliveryConf(
-    cfg: MixRlnConfig, rng: Rng
+    cfg: MixRlnConfig, rng: Rng, coverTraffic: ConstantRateCoverTraffic
 ): Result[WakuConf, string] {.raises: [].} =
-  if cfg.transport.len > 0 and cfg.transport != "tcp":
-    return err("Delivery migration currently supports only TCP transport")
+  let transport = if cfg.transport.len == 0: "tcp" else: cfg.transport
+  if transport != "tcp" and transport != "quic":
+    return err("transport must be tcp or quic")
 
   let listen =
-    if cfg.addrs.len > 0: cfg.addrs[0]
-    else: "/ip4/0.0.0.0/tcp/0"
-  let (listenAddress, listenPort) = listenEndpoint(listen).valueOr:
+    if cfg.addrs.len > 0:
+      cfg.addrs[0]
+    elif transport == "quic":
+      "/ip4/0.0.0.0/udp/0/quic-v1"
+    else:
+      "/ip4/0.0.0.0/tcp/0"
+  let (listenAddress, listenPort) = listenEndpoint(listen, transport).valueOr:
     return err(error)
   if cfg.rln.coordCluster < 0 or cfg.rln.coordCluster > high(uint16).int64:
     return err("RLN coordination cluster is out of range")
@@ -274,7 +290,12 @@ proc buildDeliveryConf(
   builder.withShardingConf(AutoSharding)
   builder.withNumShardsInCluster(1)
   builder.withP2pListenAddress(listenAddress)
-  builder.withP2pTcpPort(listenPort)
+  if transport == "quic":
+    builder.withP2pTcpPort(Port(0))
+    builder.quicConf.withEnabled(true)
+    builder.quicConf.withQuicPort(listenPort)
+  else:
+    builder.withP2pTcpPort(listenPort)
   builder.withMix(true)
   if cfg.maxConnections > 0:
     builder.withMaxConnections(cfg.maxConnections)
@@ -283,6 +304,7 @@ proc buildDeliveryConf(
   if cfg.mix.mixPrivKeyHex.len > 0:
     builder.mixConf.withMixKey(cfg.mix.mixPrivKeyHex)
   builder.mixConf.withMixRln(buildRlnConfig(cfg))
+  builder.mixConf.withCoverTraffic(CoverTraffic(coverTraffic))
   builder.build(rng)
 
 proc libp2pMixRlnCreate*(
@@ -295,12 +317,24 @@ proc libp2pMixRlnCreate*(
   ## the freshly-built LibMixRln. Nim-ffi transfers ownership to the C side,
   ## which releases it via the `{.ffiDtor.}` below.
   let rng = newRng()
+  let transport = if cfg.transport.len == 0: "tcp" else: cfg.transport
+  if cfg.mix.coverRateFraction <= 0.0 or cfg.mix.coverRateFraction > 1.0:
+    return err("coverRateFraction must be in (0.0, 1.0]")
+  if cfg.rln.userMessageLimit <= 0:
+    return err("userMessageLimit must be positive")
+  if cfg.rln.epochDurationSeconds <= 0:
+    return err("epochDurationSeconds must be positive")
 
-  let conf = buildDeliveryConf(cfg, rng).valueOr:
+  let coverTraffic = ConstantRateCoverTraffic.new(
+    totalSlots = cfg.rln.userMessageLimit,
+    epochDuration = cfg.rln.epochDurationSeconds.seconds,
+    coverRateFraction = cfg.mix.coverRateFraction,
+    useInternalEpochTimer = false,
+  )
+
+  let conf = buildDeliveryConf(cfg, rng, coverTraffic).valueOr:
     return err(error)
-  let node = (
-    await setupNode(conf, rng, circuit_relay.Relay.new())
-  ).valueOr:
+  let node = (await setupNode(conf, rng, circuit_relay.Relay.new())).valueOr:
     return err(error)
   if node.wakuMix.isNil() or node.wakuMixRln.isNil():
     await node.stop()
@@ -309,15 +343,18 @@ proc libp2pMixRlnCreate*(
     await node.stop()
     return err("Delivery Mix mounted on a different libp2p switch")
 
-  ok(LibMixRln(
-    node: node,
-    mixProto: node.wakuMix,
-    rlnPlugin: node.wakuMixRln,
-    mixPubKey: node.wakuMix.pubKey.getBytes(),
-    coverRateFraction: cfg.mix.coverRateFraction,
-    running: false,
-    stopped: false,
-  ))
+  ok(
+    LibMixRln(
+      node: node,
+      mixProto: node.wakuMix,
+      coverTraffic: coverTraffic,
+      rlnPlugin: node.wakuMixRln,
+      mixPubKey: node.wakuMix.pubKey.getBytes(),
+      transport: transport,
+      running: false,
+      stopped: false,
+    )
+  )
 
 proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
   ## Stops the Delivery node (idempotent) and drops references. The FFI runtime
@@ -333,19 +370,46 @@ proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
 # ----------------------------------------------------------------------------
 # Lifecycle
 # ----------------------------------------------------------------------------
+proc isTransportAddr(raw, transport: string): bool =
+  if transport == "quic":
+    raw.contains("/udp/") and raw.endsWith("/quic-v1")
+  else:
+    raw.contains("/tcp/")
+
+proc selectMixAddr(
+    addrs: openArray[string], transport: string
+): Result[MultiAddress, string] {.raises: [].} =
+  for raw in addrs:
+    if isTransportAddr(raw, transport):
+      let ma = MultiAddress.init(raw).valueOr:
+        return err("invalid " & transport & " multiaddr: " & error)
+      return ok(ma)
+  err("no bound " & transport & " multiaddr found")
 
 proc libp2pMixRlnStart*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
-  if lib.running: return ok(true)
+  if lib.running:
+    return ok(true)
   try:
     await lib.node.start()
   except CatchableError as e:
     return err("Delivery node start failed: " & e.msg)
-  lib.running = true
+  var boundAddrs: seq[string]
+  for addr in lib.node.switch.peerInfo.addrs:
+    boundAddrs.add($addr)
+  let localAddr = selectMixAddr(boundAddrs, lib.transport).valueOr:
+    await lib.node.stop()
+    return err(error)
+  lib.mixProto.setLocalMultiAddr(localAddr).isOkOr:
+    await lib.node.stop()
+    return err("failed to set local Mix address: " & error)
+
   lib.stopped = false
+  lib.running = true
   ok(true)
 
 proc libp2pMixRlnStop*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
-  if not lib.running: return ok(true)
+  if not lib.running:
+    return ok(true)
   try:
     await lib.node.stop()
   except CatchableError as e:
@@ -375,7 +439,10 @@ proc libp2pMixRlnGetNodeInfo*(
     # Curve25519 pub, 32 bytes, hex-encoded.
     ok(NodeInfoResponse(value: byteutils.toHex(lib.mixPubKey)))
   of NIF_RlnMembershipIndex:
-    err("not implemented — RlnMembershipIndex accessor pending")
+    let index = lib.rlnPlugin.getMembershipIndex()
+    if index.isNone:
+      return err("RLN membership is not registered")
+    ok(NodeInfoResponse(value: $index.get()))
 
 # ----------------------------------------------------------------------------
 # RLN membership
@@ -390,9 +457,7 @@ proc libp2pMixRlnRegisterRlnMembership*(
     return err("registerSelf failed: " & error)
   # The Merkle root is available via the group manager; wire it into the
   # event body once that accessor's name is confirmed.
-  onRlnMembershipRegistered(
-    RlnMembershipRegisteredEvent(index: int64(idx), root: @[])
-  )
+  onRlnMembershipRegistered(RlnMembershipRegisteredEvent(index: int64(idx), root: @[]))
   ok(RlnMembershipStatus(registered: true, index: int64(idx)))
 
 proc libp2pMixRlnHasRlnMembership*(
@@ -424,8 +489,10 @@ proc libp2pMixRlnSendMixMessage*(
       when defined(libp2p_mix_experimental_exit_is_dest):
         MixDestination.exitNode(destPid)
       else:
-        return err("isExitDest set but library built without " &
-                   "-d:libp2p_mix_experimental_exit_is_dest")
+        return err(
+          "isExitDest set but library built without " &
+            "-d:libp2p_mix_experimental_exit_is_dest"
+        )
     else:
       let addr0 = MultiAddress.init(req.destMultiaddr).valueOr:
         return err("invalid destMultiaddr: " & error)
@@ -434,8 +501,17 @@ proc libp2pMixRlnSendMixMessage*(
   var params = MixParameters()
   if req.expectReply:
     params.expectReply = Opt.some(true)
-    let n = if req.numSurbs > 0: byte(req.numSurbs) else: byte(1)
+    let n =
+      if req.numSurbs > 0:
+        byte(req.numSurbs)
+      else:
+        byte(1)
     params.numSurbs = Opt.some(n)
+    if req.timeoutMs > 0:
+      params.replyTimeout = Opt.some(req.timeoutMs.milliseconds)
+
+  if req.expectReply and not lib.mixProto.hasDestReadBehavior(req.proto):
+    lib.mixProto.registerDestReadBehavior(req.proto, readLp(MessageSize))
 
   let conn = lib.mixProto.toConnection(dest, req.proto, params).valueOr:
     return err("toConnection failed: " & error)
@@ -443,23 +519,49 @@ proc libp2pMixRlnSendMixMessage*(
   try:
     await conn.writeLp(req.payload)
   except LPStreamError as e:
-    try: await conn.close()
-    except CatchableError: discard
+    try:
+      await conn.close()
+    except CatchableError:
+      discard
     return err("writeLp failed: " & e.msg)
+
+  var reply: seq[byte]
+  if req.expectReply:
+    try:
+      reply = await conn.readLp(MessageSize)
+    except LPStreamError as e:
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      return err("reply read failed: " & e.msg)
 
   try:
     await conn.close()
   except CatchableError as e:
     warn "conn.close failed after send", err = e.msg
 
-  ok(MixSendResponse(ok: true))
+  ok(MixSendResponse(ok: true, reply: reply))
+
+proc serializeSurb(surb: SURB): seq[byte] =
+  surb.hop.serialize() & surb.header.serialize() & surb.key
 
 proc libp2pMixRlnSendMixSurbReply*(
     lib: LibMixRln, req: MixSurbReplyRequest
 ): Future[Result[bool, string]] {.ffi.} =
-  # SURB reply path uses the mix protocol's reply-connection surface; wire
-  # this once the reply store lookup API is confirmed at the pinned SHA.
-  err("not implemented — SURB reply pending")
+  let decoded = extractSURBs(@[1.byte] & req.surb).valueOr:
+    return err("invalid SURB: " & error)
+  let (surbs, trailing) = decoded
+  if surbs.len != 1 or trailing.len != 0:
+    return err("SURB must contain exactly one reply block")
+
+  let prefix = PB.toBytes(req.payload.len.uint64)
+  var framed = newSeq[byte](prefix.len + req.payload.len)
+  framed[0 ..< prefix.len] = prefix.toOpenArray()
+  framed[prefix.len ..< framed.len] = req.payload
+  (await lib.mixProto.sendSurbReply(surbs[0], move(framed))).isOkOr:
+    return err(error)
+  ok(true)
 
 # ----------------------------------------------------------------------------
 # Discovery / cover traffic
@@ -496,22 +598,22 @@ proc libp2pMixRlnGetLocalMixPeerRecord*(
   # The libp2p pub key in MixNodeInfo is an SkPublicKey (raw secp256k1 pub).
   # `toRaw` gives 33 compressed bytes.
   let libp2pPubKeyBytes = lib.node.switch.peerInfo.publicKey.skkey.getBytes()
-  ok(MixPeerRecord(
-    peerId: $lib.node.switch.peerInfo.peerId,
-    multiaddrs: addrs,
-    mixPubKey: lib.mixPubKey,
-    libp2pPubKeyHex: byteutils.toHex(libp2pPubKeyBytes),
-  ))
+  ok(
+    MixPeerRecord(
+      peerId: $lib.node.switch.peerInfo.peerId,
+      multiaddrs: addrs,
+      mixPubKey: lib.mixPubKey,
+      libp2pPubKeyHex: byteutils.toHex(libp2pPubKeyBytes),
+    )
+  )
 
 proc libp2pMixRlnAddMixPeer*(
     lib: LibMixRln, rec: MixPeerRecord
 ): Future[Result[bool, string]] {.ffi.} =
   let peerId = PeerId.init(rec.peerId).valueOr:
     return err("invalid peerId: " & $error)
-  if rec.multiaddrs.len == 0:
-    return err("empty multiaddrs")
-  let ma = MultiAddress.init(rec.multiaddrs[0]).valueOr:
-    return err("invalid multiaddr: " & error)
+  let ma = selectMixAddr(rec.multiaddrs, lib.transport).valueOr:
+    return err(error)
   let mixPub = bytesToFieldElement(rec.mixPubKey).valueOr:
     return err("invalid mixPubKey: " & error)
   var libp2pPubBytes: seq[byte]
@@ -523,9 +625,7 @@ proc libp2pMixRlnAddMixPeer*(
     return err("SkPublicKey.init failed: " & $error)
   lib.mixProto.nodePool.add(MixPubInfo.init(peerId, ma, mixPub, libp2pPub))
   let remote = RemotePeerInfo.init(
-    peerId,
-    @[ma],
-    mixPubKey = Opt.some(lp_curve25519.intoCurve25519Key(rec.mixPubKey)),
+    peerId, @[ma], mixPubKey = Opt.some(lp_curve25519.intoCurve25519Key(rec.mixPubKey))
   )
   try:
     await lib.node.connectToNodes(@[remote], "mix FFI")
@@ -548,10 +648,12 @@ proc libp2pMixRlnDeliverCoordFrame*(
   let plugin = lib.rlnPlugin
   if frame.contentTopic == plugin.getMembershipContentTopic():
     let r = await plugin.handleMembershipUpdate(frame.data)
-    if r.isErr: return err("handleMembershipUpdate failed: " & r.error)
+    if r.isErr:
+      return err("handleMembershipUpdate failed: " & r.error)
   elif frame.contentTopic == plugin.getProofMetadataContentTopic():
     let r = plugin.handleProofMetadata(frame.data)
-    if r.isErr: return err("handleProofMetadata failed: " & r.error)
+    if r.isErr:
+      return err("handleProofMetadata failed: " & r.error)
   else:
     return err("unknown contentTopic: " & frame.contentTopic)
   ok(true)
@@ -564,7 +666,11 @@ proc libp2pMixRlnMountReceiver*(
   ## event with the payload, and closes. Also registers a
   ## `readLp(maxSize)` DestReadBehavior on the mix protocol so exit-is-dest
   ## replies frame correctly.
-  let maxSize = if req.maxSize > 0: int(req.maxSize) else: 1 shl 20  # 1MiB
+  let maxSize =
+    if req.maxSize > 0:
+      int(req.maxSize)
+    else:
+      1 shl 20 # 1MiB
   let codec = req.codec
 
   let handler = proc(
@@ -572,14 +678,21 @@ proc libp2pMixRlnMountReceiver*(
   ) {.async: (raises: [CancelledError]).} =
     try:
       let bytes = await conn.readLp(maxSize)
-      onIncomingMixMessage(IncomingMixMessageEvent(
-        proto: proto, payload: bytes, surb: @[]
-      ))
+      var surb: seq[byte]
+      if conn of MixExitConnection:
+        let surbs = MixExitConnection(conn).takeSURBs()
+        if surbs.len > 0:
+          surb = serializeSurb(surbs[0])
+      onIncomingMixMessage(
+        IncomingMixMessageEvent(proto: proto, payload: bytes, surb: surb)
+      )
     except LPStreamError as e:
       warn "MountReceiver: readLp failed", codec = proto, err = e.msg
     finally:
-      try: await conn.close()
-      except CatchableError: discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
 
   let p = LPProtocol.new(codecs = @[codec], handler = handler)
   # When the Switch is already started (typical for post-start mounts triggered
@@ -595,16 +708,15 @@ proc libp2pMixRlnMountReceiver*(
 proc libp2pMixRlnGetCoverTrafficRate*(
     lib: LibMixRln
 ): Future[Result[CoverRateResponse, string]] {.ffi.} =
-  ok(CoverRateResponse(rate: lib.coverRateFraction))
+  ok(CoverRateResponse(rate: lib.coverTraffic.coverRateFraction()))
 
 proc libp2pMixRlnSetCoverTrafficRate*(
     lib: LibMixRln, req: SetCoverRateRequest
 ): Future[Result[bool, string]] {.ffi.} =
-  if req.rate < 0.0 or req.rate > 1.0:
-    return err("rate must be in [0.0, 1.0]")
-  lib.coverRateFraction = req.rate
-  # TODO: propagate to the cover-traffic scheduler once its handle is exposed
-  # via `MixProtocol.new(..., coverTraffic = Opt.some(CoverTraffic))`.
+  if req.rate <= 0.0 or req.rate > 1.0:
+    return err("rate must be in (0.0, 1.0]")
+  (await lib.coverTraffic.setCoverRateFraction(req.rate)).isOkOr:
+    return err(error)
   ok(true)
 
 # ----------------------------------------------------------------------------
