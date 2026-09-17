@@ -3,12 +3,10 @@ mode = ScriptMode.Verbose
 packageName = "nim_libp2p_mix_rln_ffi"
 version     = "0.1.0"
 author      = "Logos"
-description = "C FFI facade composing Logos Delivery, nim-libp2p-mix, and Mix-RLN. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
+description = "C FFI facade composing libp2p, nim-libp2p-mix, and Mix-RLN. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
 license     = "MIT OR Apache-2.0"
 
 # Direct deps ---------------------------------------------------------------
-# Delivery owns the libp2p node and transitively pins libp2p, nim-libp2p-mix,
-# and the Mix-RLN plugin to one compatible dependency graph.
 # nim-ffi at the pinned SHA requires nim >= 2.2.6.
 requires "nim >= 2.2.6"
 requires "chronos == 4.2.5"
@@ -19,12 +17,12 @@ requires "metrics"
 requires "nimcrypto >= 0.6.0"
 requires "taskpools >= 0.1.0"
 
-# Match Delivery's nim-ffi/CBOR toolchain to avoid a second serialization graph.
+# Pin the FFI/CBOR toolchain.
 requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
-# Exact head of logos-delivery PR #4185. Keep this immutable while the stacked
-# Delivery integration PRs are awaiting merge.
-requires "https://github.com/logos-messaging/logos-delivery.git#8a254b7e136bf5ce9660ebf746f2ebe69bd54bd7"
+requires "libp2p == 2.3.1"
+requires "https://github.com/richard-ramos/nim-libp2p-mix#57def1fef5763fc4cc27a386276cd65165eeb489"
+requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#dc820fd676fa6c44c1e8847e29afcd2bc39200fe"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:

@@ -5,24 +5,7 @@
 ## (so librln.a MUST be linked) and needs -lstdc++ (Rust's exception glue).
 
 let
-  rawCbindDeps = import ./cbind-deps.nix { inherit pkgs; };
-
-  natTraversalBuilt = pkgs.stdenv.mkDerivation {
-    name = "nim-nat-traversal-with-libs";
-    src = rawCbindDeps.nat_traversal;
-    nativeBuildInputs = [ pkgs.gnumake pkgs.gcc ];
-    dontConfigure = true;
-    buildPhase = ''
-      (cd vendor/miniupnp/miniupnpc && \
-        make CFLAGS="-Os -fPIC" build/libminiupnpc.a)
-      (cd vendor/libnatpmp-upstream && \
-        make CFLAGS="-Wall -Os -fPIC -DENABLE_STRNATPMPERR -DNATPMP_MAX_RETRIES=4" \
-          libnatpmp.a)
-    '';
-    installPhase = ''mkdir -p $out && cp -r . $out'';
-  };
-
-  cbindDeps = rawCbindDeps // { nat_traversal = natTraversalBuilt; };
+  cbindDeps = import ./cbind-deps.nix { inherit pkgs; };
   pathArgs =
     builtins.concatStringsSep " "
       (map (p: "--path:${p} --path:${p}/src")
@@ -51,6 +34,7 @@ pkgs.stdenv.mkDerivation {
   '';
 
   installPhase = ''
+    set -eo pipefail
     mkdir -p $out
     ./test_mix_routing_rln 2>&1 | tee $out/log
     cp test_mix_routing_rln $out/

@@ -1,35 +1,15 @@
-{ pkgs, src, librln ? null }:
+{ pkgs, src, librln }:
 
 ## Runs tests/test_mix_routing.nim end-to-end: builds it with the same
 ## `--path:` args cbind.nix uses, then executes it as the derivation's
 ## `installPhase`, capturing the log into $out/log. Success = derivation
 ## builds; the log records the actual ping RTT.
 ##
-## Reuses cbind.nix's cbindDeps + natTraversalBuilt setup by re-importing.
+## Reuses cbind.nix's pinned dependency set.
 
 let
   # Re-import the same dep set cbind.nix builds against; keeps them in sync.
-  rawCbindDeps = import ./cbind-deps.nix { inherit pkgs; };
-
-  natTraversalBuilt = pkgs.stdenv.mkDerivation {
-    name = "nim-nat-traversal-with-libs";
-    src = rawCbindDeps.nat_traversal;
-    nativeBuildInputs = [ pkgs.gnumake pkgs.gcc ];
-    dontConfigure = true;
-    buildPhase = ''
-      (cd vendor/miniupnp/miniupnpc && \
-        make CFLAGS="-Os -fPIC" build/libminiupnpc.a)
-      (cd vendor/libnatpmp-upstream && \
-        make CFLAGS="-Wall -Os -fPIC -DENABLE_STRNATPMPERR -DNATPMP_MAX_RETRIES=4" \
-          libnatpmp.a)
-    '';
-    installPhase = ''
-      mkdir -p $out
-      cp -r . $out
-    '';
-  };
-
-  cbindDeps = rawCbindDeps // { nat_traversal = natTraversalBuilt; };
+  cbindDeps = import ./cbind-deps.nix { inherit pkgs; };
 
   pathArgs =
     builtins.concatStringsSep " "
@@ -37,10 +17,7 @@ let
            (builtins.attrValues cbindDeps));
 
   librlnLinkArgs =
-    if librln == null then
-      throw "test-mix-routing.nix: librln input is required (path to librln.a)"
-    else
-      "--passL:${librln} --passL:-lm --passL:-lstdc++";
+    "--passL:${librln} --passL:-lm --passL:-lstdc++";
 in
 pkgs.stdenv.mkDerivation {
   pname = "nim-libp2p-mix-rln-ffi-test-mix-routing";
@@ -65,11 +42,13 @@ pkgs.stdenv.mkDerivation {
       ${librlnLinkArgs} \
       --nimcache:$NIMCACHE -o:test_mix_routing \
       tests/test_mix_routing.nim
+
   '';
 
   # We RUN the test as part of the build — a passing derivation = a passing
   # test. Output the log so post-hoc inspection is possible.
   installPhase = ''
+    set -euo pipefail
     mkdir -p $out
     echo "== Running test_mix_routing =="
     ./test_mix_routing 2>&1 | tee $out/log

@@ -113,6 +113,14 @@ static void on_mix_send(int ec, const MixSendResponse* r, const char* em, void* 
 
 // Deep-copies the reply into the waiter — the reply memory is owned by the
 
+static void on_peers(int ec, const MixPeersResponse* r, const char* em, void* ud) {
+    Waiter* w = (Waiter*)ud;
+    w->err_code = ec;
+    w->reply_index = r ? (int64_t)r->peers.len : -1;
+    if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
+    waiter_signal(w);
+}
+
 static void on_node_info(int ec, const NodeInfoResponse* r,
                          const char* em, void* ud) {
     Waiter* w = (Waiter*)ud;
@@ -139,6 +147,7 @@ static void on_peer_record(int ec, const MixPeerRecord* r,
     w->err_code = ec;
     if (r) {
         memset(&w->rec, 0, sizeof(w->rec));
+        w->rec.exitEnabled = r->exitEnabled;
         // peerId
         w->rec.peerId.data = strndup(r->peerId.data ? r->peerId.data : "",
                                      r->peerId.data ? r->peerId.len : 0);
@@ -222,7 +231,42 @@ static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
 
 // -------- node builder ----------------------------------------------------
 
-static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transport) {
+static int check_create_config(MixRlnConfig cfg) {
+    const char* bad_keys[] = {"not-hex", "01", "0000000000000000000000000000000000000000000000000000000000000000"};
+    for (size_t i = 0; i < sizeof(bad_keys) / sizeof(bad_keys[0]); i++) {
+        cfg.privKeyHex = nimffi_str(bad_keys[i]);
+        Waiter w; waiter_init(&w);
+        (void)libp2p_mix_rln_ctx_create(&cfg, on_created, &w);
+        if (waiter_wait(&w, 60) || !w.err_code || w.ctx) return -1;
+    }
+    const char* keys[] = {
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    };
+    char peer_id[512] = {0};
+    for (size_t i = 0; i < 2; i++) {
+        cfg.privKeyHex = nimffi_str(keys[i]);
+        Waiter w; waiter_init(&w);
+        (void)libp2p_mix_rln_ctx_create(&cfg, on_created, &w);
+        if (waiter_wait(&w, 60) || w.err_code || !w.ctx) return -1;
+        NodeInfoRequest req = {.field = NODE_INFO_FIELD_NIF_PEER_ID};
+        Waiter info; waiter_init(&info);
+        (void)libp2p_mix_rln_ctx_get_node_info(w.ctx, &req, on_node_info, &info);
+        if (waiter_wait(&info, 10) || info.err_code) return -1;
+        libp2p_mix_rln_ctx_destroy(w.ctx);
+        if (i == 0) snprintf(peer_id, sizeof(peer_id), "%s", info.reply_string);
+        else if (strcmp(peer_id, info.reply_string)) return -1;
+    }
+    cfg.privKeyHex = nimffi_str("");
+    NimFfiStr bad_addr = nimffi_str("/ip6/::1/tcp/0");
+    cfg.addrs.data = &bad_addr;
+    cfg.addrs.len = 1;
+    Waiter w; waiter_init(&w);
+    (void)libp2p_mix_rln_ctx_create(&cfg, on_created, &w);
+    return waiter_wait(&w, 60) || !w.err_code || w.ctx ? -1 : 0;
+}
+
+static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transport, bool allow_send, bool allow_exit) {
     NimFfiStr addr = nimffi_str(listen_multiaddr);
     MixRlnConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -230,21 +274,24 @@ static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transpo
     cfg.addrs.len = 1;
     cfg.transport = nimffi_str(transport);
     cfg.maxConnections = 50;
-    cfg.maxInConnections = 25;
-    cfg.maxOutConnections = 25;
-    cfg.maxConnsPerPeer = 1;
+    cfg.maxConnsPerPeer = 2;
+    cfg.mix.allowSend = allow_send;
+    cfg.mix.allowExit = allow_exit;
     cfg.mix.coverRateFraction = 0.01;
     cfg.rln.epochDurationSeconds = 1;
-    cfg.rln.period = 1;
-    cfg.rln.messagingRate = 10;
     cfg.rln.maxEpochGap = 20;
     cfg.rln.userMessageLimit = 100;
-    cfg.rln.acceptableRootWindowSize = 5;
     cfg.rln.membershipContentTopic = nimffi_str("/mix/rln/membership/v1");
     cfg.rln.proofMetadataContentTopic = nimffi_str("/mix/rln/metadata/v1");
-    cfg.discovery.mountServiceDiscovery = false;
-    cfg.discovery.serviceId = nimffi_str("logos.mixnet");
 
+    static bool config_checked = false;
+    if (!config_checked) {
+        if (check_create_config(cfg)) {
+            fprintf(stderr, "configuration validation failed\n");
+            return NULL;
+        }
+        config_checked = true;
+    }
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_create(&cfg, on_created, &w);
     if (waiter_wait(&w, 60) != 0 || w.err_code != 0 || !w.ctx) {
@@ -300,6 +347,88 @@ static int stop_node(LibMixRlnCtx* ctx) {
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_stop(ctx, on_bool, &w);
     if (waiter_wait(&w, 30) != 0) return -1;
+    return 0;
+}
+
+// -------- RLN coord bus ---------------------------------------------------
+//
+// In production, an RLN publish_requested event goes out on RLN Relay and is
+// re-delivered to every other node's plugin via the coord channel. For this
+// in-process test we bridge synchronously: onRlnPublishRequested captures the
+// frame, and after each origin op we drain the queue into every other node's
+// `libp2pMixRlnDeliverCoordFrame`.
+
+typedef struct {
+    uint8_t*    data;
+    size_t      len;
+    char*       topic;
+    LibMixRlnCtx* source;
+} CoordFrame;
+
+typedef struct {
+    pthread_mutex_t m;
+    CoordFrame*     frames;
+    size_t          count;
+    size_t          cap;
+} CoordBus;
+
+static CoordBus g_bus;
+
+static void bus_init(void) {
+    pthread_mutex_init(&g_bus.m, NULL);
+    g_bus.frames = NULL; g_bus.count = 0; g_bus.cap = 0;
+}
+
+static void bus_push(const char* topic, size_t topic_len,
+                     const uint8_t* data, size_t data_len, LibMixRlnCtx* source) {
+    pthread_mutex_lock(&g_bus.m);
+    if (g_bus.count == g_bus.cap) {
+        g_bus.cap = g_bus.cap ? g_bus.cap * 2 : 8;
+        g_bus.frames = realloc(g_bus.frames, g_bus.cap * sizeof(CoordFrame));
+    }
+    CoordFrame* f = &g_bus.frames[g_bus.count++];
+    f->topic = strndup(topic, topic_len);
+    f->data = malloc(data_len);
+    memcpy(f->data, data, data_len);
+    f->len = data_len;
+    f->source = source;
+    pthread_mutex_unlock(&g_bus.m);
+}
+
+static void on_rln_publish(const RlnPublishRequestedEvent* evt, void* ud) {
+    (void)ud;
+    if (!evt) return;
+    bus_push(evt->contentTopic.data, evt->contentTopic.len,
+             evt->payload.data, evt->payload.len, ud);
+}
+
+// Detach the queue before submitting FFI calls; callbacks can enqueue concurrently.
+static int drain_bus_to_all(LibMixRlnCtx** nodes, int n) {
+    pthread_mutex_lock(&g_bus.m);
+    size_t count = g_bus.count;
+    CoordFrame* frames = g_bus.frames;
+    g_bus.frames = NULL; g_bus.count = 0; g_bus.cap = 0;
+    pthread_mutex_unlock(&g_bus.m);
+    for (size_t i = 0; i < count; i++) {
+        RlnCoordFrame req;
+        memset(&req, 0, sizeof(req));
+        req.contentTopic = nimffi_str(frames[i].topic);
+        req.data.data = frames[i].data;
+        req.data.len  = frames[i].len;
+        for (int k = 0; k < n; k++) {
+            if (nodes[k] == frames[i].source) continue;
+            Waiter w; waiter_init(&w);
+            (void)libp2p_mix_rln_ctx_deliver_coord_frame(nodes[k], &req, on_bool, &w);
+            if (waiter_wait(&w, 10) != 0 || w.err_code != 0) {
+                fprintf(stderr, "deliver_coord_frame TIMEOUT on node %d\n", k);
+                return -1;
+            }
+
+        }
+        free(frames[i].topic);
+        free(frames[i].data);
+    }
+    free(frames);
     return 0;
 }
 
@@ -374,7 +503,7 @@ int main(void) {
     LibMixRlnCtx* nodes[N];
     MixPeerRecord recs[N];
     for (int i = 0; i < N; i++) {
-        nodes[i] = make_node(listen_multiaddr, transport);
+        nodes[i] = make_node(listen_multiaddr, transport, i == 0 || i == N - 1, i == N - 1);
         if (!nodes[i]) { fprintf(stderr, "node[%d] create failed\n", i); return 1; }
     }
     fprintf(stderr, "[smoke] %d nodes created\n", N);
@@ -420,21 +549,27 @@ int main(void) {
             if (add_peer(nodes[i], &recs[j], label)) return 1;
         }
     fprintf(stderr, "[smoke] cross-registered all %dx%d peers\n", N, N - 1);
+    for (int i = 0; i < N; i++) {
+        Waiter w; waiter_init(&w);
+        (void)libp2p_mix_rln_ctx_list_mix_peers(nodes[i], on_peers, &w);
+        if (waiter_wait(&w, 10) || w.err_code || w.reply_index != N - 1) {
+            fprintf(stderr, "list_mix_peers[%d] did not return the routing pool\n", i);
+            return 1;
+        }
+    }
     LibMixRlnCtx* A = nodes[0];      // sender
     LibMixRlnCtx* C = nodes[N - 1];  // exit / destination
     MixPeerRecord* recC = &recs[N - 1];
 
-    // Membership updates propagate over Delivery Relay. Registrations remain
-    // sequential until distributed member-index allocation is implemented.
+    bus_init();
+    for (int i = 0; i < N; i++)
+        (void)libp2p_mix_rln_ctx_add_on_rln_publish_requested_listener(
+            nodes[i], on_rln_publish, nodes[i]);
     int64_t membership_indices[N];
-    struct timespec membership_settle = { .tv_sec = 1, .tv_nsec = 0 };
     for (int i = 0; i < N; i++) {
         membership_indices[i] = register_membership(nodes[i], i);
-        if (membership_indices[i] < 0) return 1;
-        nanosleep(&membership_settle, NULL);
+        if (membership_indices[i] != i || drain_bus_to_all(nodes, N)) return 1;
     }
-    struct timespec relay_settle = { .tv_sec = 2, .tv_nsec = 0 };
-    nanosleep(&relay_settle, NULL);
     for (int i = 0; i < N; i++) {
         int64_t looked_up = -1;
         if (get_membership_index(nodes[i], &looked_up) ||
@@ -443,7 +578,30 @@ int main(void) {
             return 1;
         }
     }
-    fprintf(stderr, "[smoke] all RLN memberships registered over Delivery Relay\n");
+    fprintf(stderr, "[smoke] all RLN memberships registered through host coordination\n");
+
+    // A default intermediate must reject every endpoint API, before parsing
+    // destination/SURB input or consuming a rate-limit slot.
+    MixSendRequest denied_send = {0};
+    Waiter denied; waiter_init(&denied);
+    (void)libp2p_mix_rln_ctx_send_mix_message(nodes[1], &denied_send, on_mix_send, &denied);
+    if (waiter_wait(&denied, 10) || denied.err_code == 0 ||
+        !strstr(denied.err_msg, "mix.allowSend")) return 1;
+    MixSurbReplyRequest denied_reply = {0};
+    Waiter denied_surb; waiter_init(&denied_surb);
+    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(nodes[1], &denied_reply, on_bool, &denied_surb);
+    if (waiter_wait(&denied_surb, 10) || denied_surb.err_code == 0 ||
+        !strstr(denied_surb.err_msg, "mix.allowSend")) return 1;
+    MountReceiverRequest denied_receiver = {0};
+    // Sender-only node also cannot mount an exit receiver.
+    Waiter denied_mount; waiter_init(&denied_mount);
+    (void)libp2p_mix_rln_ctx_mount_receiver(A, &denied_receiver, on_bool, &denied_mount);
+    if (waiter_wait(&denied_mount, 10) || denied_mount.err_code == 0 ||
+        !strstr(denied_mount.err_msg, "mix.allowExit")) return 1;
+    for (int i = 0; i < N; i++) {
+        if (recs[i].exitEnabled != (i == N - 1)) return 1;
+    }
+    fprintf(stderr, "[smoke] default endpoint denial and exit advertisements verified\n");
 
     // Mount receiver on C.
     MountReceiverRequest mreq;

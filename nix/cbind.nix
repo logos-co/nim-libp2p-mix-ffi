@@ -1,40 +1,14 @@
-{ pkgs, src, librln ? null }:
+{ pkgs, src, librln }:
 
 ## Hermetic build of the FFI shared library + generated C header.
 ##
-## Uses the exact dependency graph from the pinned Delivery revision plus the
-## Delivery source itself and a mandatory `librln.a` input.
+## Uses pinned libp2p, Mix, RLN and FFI dependencies and a mandatory `librln.a` input.
 ##
 ## `librln`: path to the librln.a static archive from vacp2p/zerokit. Passed in
 ## from the flake so packaging zerokit stays out of scope here.
 
 let
-  rawCbindDeps = import ./cbind-deps.nix { inherit pkgs; };
-
-  # nim-nat-traversal ships C sources under `vendor/{miniupnp,libnatpmp-upstream}`
-  # and expects `nimble install` to run its `before install` hook, which compiles
-  # them into `libminiupnpc.a` / `libnatpmp.a` at hardcoded relative paths that
-  # nim-libp2p's `{.link.}` pragmas depend on. `fetchgit` skips that hook, so we
-  # wrap the source tree with a derivation that runs the makefiles.
-  natTraversalBuilt = pkgs.stdenv.mkDerivation {
-    name = "nim-nat-traversal-with-libs";
-    src = rawCbindDeps.nat_traversal;
-    nativeBuildInputs = [ pkgs.gnumake pkgs.gcc ];
-    dontConfigure = true;
-    buildPhase = ''
-      (cd vendor/miniupnp/miniupnpc && \
-        make CFLAGS="-Os -fPIC" build/libminiupnpc.a)
-      (cd vendor/libnatpmp-upstream && \
-        make CFLAGS="-Wall -Os -fPIC -DENABLE_STRNATPMPERR -DNATPMP_MAX_RETRIES=4" \
-          libnatpmp.a)
-    '';
-    installPhase = ''
-      mkdir -p $out
-      cp -r . $out
-    '';
-  };
-
-  cbindDeps = rawCbindDeps // { nat_traversal = natTraversalBuilt; };
+  cbindDeps = import ./cbind-deps.nix { inherit pkgs; };
 
   # Some deps put nim sources at repo root (nim-libp2p), others under `src/`
   # (mix-rln-spam-protection-plugin sets `srcDir = "src"` in its .nimble). We
@@ -53,10 +27,7 @@ let
   tinycborVendor = "${cbindDeps.ffi}/ffi/codegen/templates/cpp/vendor/tinycbor";
 
   librlnLinkArgs =
-    if librln == null then
-      throw "nim-libp2p-mix-rln-ffi/nix/cbind.nix: librln input is required (path to librln.a)"
-    else
-      "--passL:${librln} --passL:-lm";
+    "--passL:${librln} --passL:-lm";
 in
 pkgs.stdenv.mkDerivation {
   pname = "nim-libp2p-mix-rln-ffi-cbind";

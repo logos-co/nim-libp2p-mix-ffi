@@ -30,6 +30,7 @@ pkgs.stdenv.mkDerivation {
   '';
 
   installPhase = ''
+    set -euo pipefail
     mkdir -p $out
     MIX_TEST_TRANSPORT=tcp ./smoketest_3node_ffi 2>&1 | tee $out/tcp.log
     MIX_TEST_TRANSPORT=quic ./smoketest_3node_ffi 2>&1 | tee $out/quic.log
