@@ -5,7 +5,7 @@
 ## build = passing test.
 
 pkgs.stdenv.mkDerivation {
-  pname = "nim-libp2p-mix-rln-ffi-smoketest-3node-ffi";
+  pname = "nim-libp2p-mix-ffi-smoketest-3node-ffi";
   version = "dev";
 
   inherit src;

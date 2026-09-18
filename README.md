@@ -1,4 +1,4 @@
-# nim-libp2p-mix-rln-ffi
+# nim-libp2p-mix-ffi
 
 C FFI facade composing [libp2p][libp2p] + [nim-libp2p-mix][mix] +
 [mix-rln-spam-protection-plugin][mix-rln]. Mix owns a standalone libp2p
@@ -102,7 +102,7 @@ the backend or the membership query API.
 ## Layout
 
 ```
-nim-libp2p-mix-rln-ffi/
+nim-libp2p-mix-ffi/
 ├── nim_libp2p_mix_rln_ffi.nimble  # package + buildffi + genbindings_c
 ├── libp2p_mix_rln.nim             # FFI entry — declareLibrary(), types, procs
 ├── libp2p_mix_rln/config.nim      # {.ffi.} config schema

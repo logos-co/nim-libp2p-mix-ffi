@@ -25,7 +25,7 @@ let
 
 in
 pkgs.stdenv.mkDerivation {
-  pname = "nim-libp2p-mix-rln-ffi-cbind";
+  pname = "nim-libp2p-mix-ffi-cbind";
   version = "dev";
 
   inherit src;

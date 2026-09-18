@@ -1,8 +1,8 @@
-# Upstream issues found while building `nim-libp2p-mix-rln-ffi`
+# Upstream issues found while building `nim-libp2p-mix-ffi`
 
 Copy each section as-is into the corresponding upstream repo's issue tracker.
 Reported by: [your GitHub handle], during work on
-`logos-co/nim-libp2p-mix-rln-ffi` and `logos-co/logos-libp2p-mix-rln`.
+`logos-co/nim-libp2p-mix-ffi` and `logos-co/logos-libp2p-mix-rln`.
 
 ---
 
@@ -36,7 +36,7 @@ The same CBOR fix has since been merged as squashed commit `83f1aae` on
 `b6c17dc822960b626d76d814de90208c0a40a44e`.
 
 **Impact:** Any downstream that copies `cbind`'s `nimble.lock` as a starting
-point (as `nim-libp2p-mix-rln-ffi` does) inherits this and can't complete
+point (as `nim-libp2p-mix-ffi` does) inherits this and can't complete
 `nimble -l setup` without manual work.
 
 **Suggested fix:** Repin `nim-ffi` to a `master`-reachable SHA or to a tag
@@ -144,7 +144,7 @@ Missing public API: `MixNodeInfo.mixPubKey` bytes, cover-traffic runtime handle,
 
 ### Body
 Trying to build a full-featured FFI facade around `nim-libp2p-mix` (see
-`logos-co/nim-libp2p-mix-rln-ffi`), I hit four API gaps that force downstream
+`logos-co/nim-libp2p-mix-ffi`), I hit four API gaps that force downstream
 authors to either fork the module or leave features stubbed:
 
 1. **No public accessor to serialize `MixNodeInfo.mixPubKey` as bytes.**
@@ -187,7 +187,7 @@ LIP LOGOS-MIXNET blockers: several parameters marked TBD prevent spec-compliant 
 
 ### Body
 Working on a reference implementation
-(`logos-co/nim-libp2p-mix-rln-ffi` + `logos-co/logos-libp2p-mix-rln`), it isn't
+(`logos-co/nim-libp2p-mix-ffi` + `logos-co/logos-libp2p-mix-rln`), it isn't
 possible to ship anything spec-compliant until the following are pinned:
 
 **Numeric parameters (all TBD in spec):**
