@@ -21,6 +21,10 @@ type MixConfig* {.ffi.} = object
   coverRateFraction: float64 ## LIP LOGOS-MIXNET default: 0.7.
 
 type RlnConfig* {.ffi.} = object
+  provider: string ## "module" or the transitional "embedded" test backend.
+  registryId: string
+  rlnIdentifierHex: string
+  registrationOptionsJson: string
   keystorePath: string
   keystorePassword: string
   treePath: string

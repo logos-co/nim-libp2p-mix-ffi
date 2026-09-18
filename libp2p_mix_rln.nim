@@ -15,7 +15,7 @@
 
 import ffi
 
-import std/[strutils, tables]
+import std/[strutils, tables, json]
 import chronos
 import chronicles
 import results
@@ -41,6 +41,7 @@ import stew/byteutils
 # mix-rln-spam-protection-plugin — per-hop RLN proof gen/verify.
 import mix_rln_spam_protection
 import mix_rln_spam_protection/spam_protection as mix_rln
+import mix_rln_spam_protection/[module_api, module_transport]
 
 # LibMixRln ------------------------------------------------------------------
 
@@ -52,6 +53,9 @@ type LibMixRln* = ref object
   mixProto: MixProtocol
   coverTraffic: ConstantRateCoverTraffic
   rlnPlugin: MixRlnSpamProtection
+  moduleRln: ModuleRlnProtection
+  rlnRequests: RlnRequests
+  registrationOptions: string
   transport: string
   allowSend: bool
   running: bool
@@ -153,6 +157,15 @@ type IncomingMixMessageEvent {.ffi.} = object
   payload: seq[byte]
   surb: seq[byte] ## Raw SURB bytes; empty when the sender did not include one.
 
+type RlnModuleRequestEvent {.ffi.} = object
+  requestId: int64
+  methodName: string
+  argsJson: string
+
+type RlnModuleResponse {.ffi.} = object
+  requestId: int64
+  responseJson: string
+
 type RlnMembershipRegisteredEvent {.ffi.} = object
   index: int64
   root: seq[byte]
@@ -161,6 +174,9 @@ type RlnPublishRequestedEvent {.ffi.} = object
   ## The host must publish these bytes on the configured coordination channel.
   contentTopic: string
   payload: seq[byte]
+
+proc onRlnModuleRequest*(event: RlnModuleRequestEvent) {.ffiEvent.} =
+  ## Host invokes the shared RLN module and submits the response asynchronously.
 
 proc onIncomingMixMessage*(event: IncomingMixMessageEvent) {.ffiEvent.} =
   ## Fired when a mounted mix-destination protocol receives a message. Pass a
@@ -281,17 +297,53 @@ proc libp2pMixRlnCreate*(
       mixPubKey = lp_curve25519.public(mixPrivKey)
     except ValueError as exc:
       return err("invalid mix private key: " & exc.msg)
-  let plugin = MixRlnSpamProtection.new(buildRlnConfig(cfg)).valueOr:
-    return err(error)
-  (await plugin.init()).isOkOr:
-    return err(error)
-  plugin.setPublishCallback(
-    proc(topic: string, data: seq[byte]): Future[Result[void, string]] {.async.} =
-      onRlnPublishRequested(
-        RlnPublishRequestedEvent(contentTopic: topic, payload: data)
-      )
-      return ok()
-  )
+  let publish = proc(
+      topic: string, data: seq[byte]
+  ): Future[Result[void, string]] {.async.} =
+    onRlnPublishRequested(RlnPublishRequestedEvent(contentTopic: topic, payload: data))
+    return ok()
+  var plugin: MixRlnSpamProtection
+  var moduleRln: ModuleRlnProtection
+  var requests: RlnRequests
+  var protection: SpamProtection
+  if cfg.rln.provider == "module":
+    if cfg.rln.maxEpochGap < 0:
+      return err("maxEpochGap must be non-negative")
+    requests = RlnRequests.new(
+      proc(id: int64, methodName, argsJson: string) {.gcsafe, raises: [].} =
+        onRlnModuleRequest(
+          RlnModuleRequestEvent(
+            requestId: id, methodName: methodName, argsJson: argsJson
+          )
+        )
+    )
+    let transport = requests
+    moduleRln = ModuleRlnProtection.new(
+      ModuleRlnConfig(
+        registryId: cfg.rln.registryId,
+        rlnIdentifierHex: cfg.rln.rlnIdentifierHex,
+        epochSeconds: uint64(cfg.rln.epochDurationSeconds),
+        maxEpochGap: uint64(cfg.rln.maxEpochGap),
+        messageLimit: cfg.rln.userMessageLimit,
+        metadataTopic: cfg.rln.proofMetadataContentTopic,
+      ),
+      proc(
+          methodName: string, args: JsonNode
+      ): Future[Result[JsonNode, string]] {.async: (raises: [CancelledError]).} =
+        return await transport.request(methodName, args),
+    ).valueOr:
+      return err(error)
+    moduleRln.setPublishCallback(publish)
+    protection = moduleRln
+  elif cfg.rln.provider in ["", "embedded"]:
+    plugin = MixRlnSpamProtection.new(buildRlnConfig(cfg)).valueOr:
+      return err(error)
+    (await plugin.init()).isOkOr:
+      return err(error)
+    plugin.setPublishCallback(publish)
+    protection = plugin
+  else:
+    return err("Unknown RLN provider")
   let nodeInfo = initMixNodeInfo(
     switch.peerInfo.peerId,
     switch.peerInfo.listenAddrs[0],
@@ -303,7 +355,7 @@ proc libp2pMixRlnCreate*(
   let proto = MixProtocol.new(
     nodeInfo,
     switch,
-    spamProtection = Opt.some(SpamProtection(plugin)),
+    spamProtection = Opt.some(protection),
     delayStrategy = Opt.some(DelayStrategy(SpamProtectionDelayStrategy.new(rng = rng))),
     coverTraffic = Opt.some(CoverTraffic(coverTraffic)),
     allowExit = cfg.mix.allowExit,
@@ -316,17 +368,37 @@ proc libp2pMixRlnCreate*(
       mixProto: proto,
       coverTraffic: coverTraffic,
       rlnPlugin: plugin,
+      moduleRln: moduleRln,
+      rlnRequests: requests,
+      registrationOptions: cfg.rln.registrationOptionsJson,
       transport: transport,
     )
   )
+
+proc stopRln(lib: LibMixRln) {.async.} =
+  if not lib.rlnRequests.isNil:
+    lib.rlnRequests.cancel()
+  if not lib.moduleRln.isNil:
+    await lib.moduleRln.stop()
+  elif not lib.rlnPlugin.isNil:
+    await lib.rlnPlugin.stop()
+
+proc libp2pMixRlnRlnResponse*(
+    lib: LibMixRln, response: RlnModuleResponse
+): Future[Result[bool, string]] {.ffi.} =
+  if lib.rlnRequests.isNil:
+    return err("External RLN provider is not configured")
+  lib.rlnRequests.respond(response.requestId, response.responseJson).isOkOr:
+    return err(error)
+  return ok(true)
 
 proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
   ## Stops the Mix switch (idempotent) and drops references. The FFI runtime
   ## reclaims the LibMixRln object itself.
   if not lib.stopped:
     try:
+      await lib.stopRln()
       await lib.switch.stop()
-      await lib.rlnPlugin.stop()
     except CatchableError as e:
       warn "Mix switch stop failed", err = e.msg
     lib.stopped = true
@@ -354,23 +426,28 @@ proc selectMixAddr(
 proc libp2pMixRlnStart*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
   if lib.running:
     return ok(true)
-  (await lib.rlnPlugin.start()).isOkOr:
+  let started =
+    if not lib.moduleRln.isNil:
+      await lib.moduleRln.start()
+    else:
+      await lib.rlnPlugin.start()
+  started.isOkOr:
     return err("RLN start failed: " & error)
   try:
     await lib.switch.start()
   except CatchableError as e:
-    await lib.rlnPlugin.stop()
+    await lib.stopRln()
     return err("Mix switch start failed: " & e.msg)
   var boundAddrs: seq[string]
   for addr in lib.switch.peerInfo.addrs:
     boundAddrs.add($addr)
   let localAddr = selectMixAddr(boundAddrs, lib.transport).valueOr:
+    await lib.stopRln()
     await lib.switch.stop()
-    await lib.rlnPlugin.stop()
     return err(error)
   lib.mixProto.setLocalMultiAddr(localAddr).isOkOr:
+    await lib.stopRln()
     await lib.switch.stop()
-    await lib.rlnPlugin.stop()
     return err("failed to set local Mix address: " & error)
 
   lib.stopped = false
@@ -381,8 +458,8 @@ proc libp2pMixRlnStop*(lib: LibMixRln): Future[Result[bool, string]] {.ffi.} =
   if not lib.running:
     return ok(true)
   try:
+    await lib.stopRln()
     await lib.switch.stop()
-    await lib.rlnPlugin.stop()
   except CatchableError as e:
     return err("Mix switch stop failed: " & e.msg)
   lib.running = false
@@ -415,6 +492,11 @@ proc libp2pMixRlnGetNodeInfo*(
       )
     )
   of NIF_RlnMembershipIndex:
+    if not lib.moduleRln.isNil:
+      let state = (await lib.moduleRln.scopedCall("get_membership_state")).valueOr:
+        return err(error)
+      return
+        ok(NodeInfoResponse(value: $state.getOrDefault("leaf_index").getBiggestInt(-1)))
     let index = lib.rlnPlugin.getMembershipIndex()
     if index.isNone:
       return err("RLN membership is not registered")
@@ -428,6 +510,17 @@ proc libp2pMixRlnRegisterRlnMembership*(
     lib: LibMixRln
 ): Future[Result[RlnMembershipStatus, string]] {.ffi.} =
   ## Registers this node and requests host publication of its membership frame.
+  if not lib.moduleRln.isNil:
+    let options =
+      if lib.registrationOptions.len == 0: "[]" else: lib.registrationOptions
+    let state = (await lib.moduleRln.scopedCall("register_membership", %*[options])).valueOr:
+      return err(error)
+    return ok(
+      RlnMembershipStatus(
+        registered: state.getOrDefault("state").getStr() in ["active", "grace_period"],
+        index: state.getOrDefault("leaf_index").getBiggestInt(-1),
+      )
+    )
   let idx = (await lib.rlnPlugin.registerSelf()).valueOr:
     return err("registerSelf failed: " & error)
   # The Merkle root is available via the group manager; wire it into the
@@ -438,6 +531,15 @@ proc libp2pMixRlnRegisterRlnMembership*(
 proc libp2pMixRlnHasRlnMembership*(
     lib: LibMixRln
 ): Future[Result[RlnMembershipStatus, string]] {.ffi.} =
+  if not lib.moduleRln.isNil:
+    let state = (await lib.moduleRln.scopedCall("get_membership_state")).valueOr:
+      return err(error)
+    return ok(
+      RlnMembershipStatus(
+        registered: state.getOrDefault("state").getStr() in ["active", "grace_period"],
+        index: state.getOrDefault("leaf_index").getBiggestInt(-1),
+      )
+    )
   let opt = lib.rlnPlugin.getMembershipIndex()
   if opt.isSome:
     ok(RlnMembershipStatus(registered: true, index: int64(opt.get())))
@@ -627,6 +729,12 @@ proc libp2pMixRlnDeliverCoordFrame*(
     lib: LibMixRln, frame: RlnCoordFrame
 ): Future[Result[bool, string]] {.ffi.} =
   ## Applies a coordination frame received through the host transport.
+  if not lib.moduleRln.isNil:
+    if frame.contentTopic != lib.moduleRln.config.metadataTopic:
+      return err("Unknown coordination topic")
+    lib.moduleRln.handleProofMetadata(frame.data).isOkOr:
+      return err(error)
+    return ok(true)
   let plugin = lib.rlnPlugin
   if frame.contentTopic == plugin.getMembershipContentTopic():
     let r = await plugin.handleMembershipUpdate(frame.data)

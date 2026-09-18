@@ -22,7 +22,8 @@ receiving node independently enforces its own exit policy.
 
 ## Status
 
-FFI validated end-to-end at runtime:
+The following end-to-end checks cover the legacy embedded provider.
+Shared-provider network validation is tracked in the Logos module work summary:
 
 - Standalone C smoke test: `nim-libp2p-mix-rln-ffi-smoketest-3node-ffi`
   drives 5 nodes purely through the C API, synchronizes membership through
@@ -73,11 +74,36 @@ memberships, publish the topic and bytes through its coordination transport,
 and inject received frames with `deliverCoordFrame`. Dispatch transport calls
 outside the FFI callback. `addMixPeer` only installs a routing record; it does
 not connect the external coordination transport. TCP and QUIC both bind on
-Mix's own switch. Proof generation remains in the local Mix-RLN plugin.
+Mix's own switch. Proof generation uses the selected provider.
 
 Service discovery is not wired: `listMixPeers` reports the manually populated
-pool. Distributed membership allocation and late-join history synchronization
-remain outside this implementation.
+pool. Shared-provider membership synchronization belongs to the registry backend.
+
+## Shared RLN provider
+
+Set `RlnConfig.provider="module"`, `registryId`, and `rlnIdentifierHex` to use
+`liblogos_rln_module`. Configure matching epochs, accepted gap, and metadata
+topic on all participants. The Logos wrapper defaults to this provider; an
+empty FFI provider retains embedded behavior for existing C callers.
+
+Before starting the node, start the backend and arrange active scoped
+memberships. Subscribe to `RlnModuleRequestEvent`, forward its `methodName`
+and ordered `argsJson` arguments asynchronously, and return the backend JSON
+with `libp2pMixRlnRlnResponse` using the original request ID. Never block the
+Nim event loop waiting for a backend call. The generated C API exposes the
+response operation as `rln_response`.
+
+The adapter owns proof encoding and metadata exchange; the backend owns
+credentials, cryptography, registry state, and durable proof quota. Shared
+mode coordinates proof metadata only: it does not gossip legacy membership
+announcements. `registerRlnMembership` submits registration options to the
+backend; callers must observe activation before generating proofs. Shutdown
+cancels pending backend requests; late responses are rejected.
+
+The embedded provider remains for transition tests. Its cryptographic version
+and external-nullifier construction differ from shared mode; do not mix these
+providers in one network. The shared adapter is used by native Delivery Mix
+as well as this facade.
 
 ## Layout
 
