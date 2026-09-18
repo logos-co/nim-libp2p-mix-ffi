@@ -5,7 +5,7 @@
 ## build = passing test.
 
 pkgs.stdenv.mkDerivation {
-  pname = "nim-libp2p-mix-rln-ffi-smoketest-3node-ffi";
+  pname = "nim-libp2p-mix-ffi-smoketest-3node-ffi";
   version = "dev";
 
   inherit src;
@@ -30,6 +30,7 @@ pkgs.stdenv.mkDerivation {
   '';
 
   installPhase = ''
+    set -euo pipefail
     mkdir -p $out
     MIX_TEST_TRANSPORT=tcp ./smoketest_3node_ffi 2>&1 | tee $out/tcp.log
     MIX_TEST_TRANSPORT=quic ./smoketest_3node_ffi 2>&1 | tee $out/quic.log

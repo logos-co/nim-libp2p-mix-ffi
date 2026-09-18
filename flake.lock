@@ -18,68 +18,7 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs",
-        "zerokit": "zerokit",
-        "zerokit-nixpkgs": "zerokit-nixpkgs"
-      }
-    },
-    "rust-overlay": {
-      "inputs": {
-        "nixpkgs": [
-          "zerokit",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1771297684,
-        "narHash": "sha256-wieWskQxZLPlNXX06JEB0bMoS/ZYQ89xBzF0RL9lyLs=",
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "rev": "755d3669699a7c62aef35af187d75dc2728cfd85",
-        "type": "github"
-      },
-      "original": {
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "type": "github"
-      }
-    },
-    "zerokit": {
-      "inputs": {
-        "nixpkgs": [
-          "zerokit-nixpkgs"
-        ],
-        "rust-overlay": "rust-overlay"
-      },
-      "locked": {
-        "lastModified": 1786650974,
-        "narHash": "sha256-CpoBl58V7oRAYKGXVNs4PnG9HPhWX2uFk8vhbbIxoP4=",
-        "owner": "richard-ramos",
-        "repo": "zerokit",
-        "rev": "a263930af8a7bd95804e1e49859050afbf2dbfd5",
-        "type": "github"
-      },
-      "original": {
-        "owner": "richard-ramos",
-        "ref": "nix-rln-stateless",
-        "repo": "zerokit",
-        "type": "github"
-      }
-    },
-    "zerokit-nixpkgs": {
-      "locked": {
-        "lastModified": 1783375776,
-        "narHash": "sha256-pg6hLjDeAWaUOzh2JM2Cw0BwYpGtOyNr6A4FBwP9Ymo=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "cd648d6ea62bc0ffba91e61fcfe5e33c1e2004b1",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "cd648d6ea62bc0ffba91e61fcfe5e33c1e2004b1",
-        "type": "github"
+        "nixpkgs": "nixpkgs"
       }
     }
   },

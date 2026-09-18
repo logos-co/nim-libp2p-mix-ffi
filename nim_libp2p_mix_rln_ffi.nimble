@@ -3,12 +3,10 @@ mode = ScriptMode.Verbose
 packageName = "nim_libp2p_mix_rln_ffi"
 version     = "0.1.0"
 author      = "Logos"
-description = "C FFI facade composing Logos Delivery, nim-libp2p-mix, and Mix-RLN. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
+description = "C FFI facade composing libp2p, nim-libp2p-mix, and Mix-RLN. Produces liblibp2p_mix_rln.{so,dylib,dll} + libp2p_mix_rln.h for consumption by logos-libp2p-mix-rln."
 license     = "MIT OR Apache-2.0"
 
 # Direct deps ---------------------------------------------------------------
-# Delivery owns the libp2p node and transitively pins libp2p, nim-libp2p-mix,
-# and the Mix-RLN plugin to one compatible dependency graph.
 # nim-ffi at the pinned SHA requires nim >= 2.2.6.
 requires "nim >= 2.2.6"
 requires "chronos == 4.2.5"
@@ -19,12 +17,12 @@ requires "metrics"
 requires "nimcrypto >= 0.6.0"
 requires "taskpools >= 0.1.0"
 
-# Match Delivery's nim-ffi/CBOR toolchain to avoid a second serialization graph.
+# Pin the FFI/CBOR toolchain.
 requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
-# Exact head of logos-delivery PR #4185. Keep this immutable while the stacked
-# Delivery integration PRs are awaiting merge.
-requires "https://github.com/logos-messaging/logos-delivery.git#8a254b7e136bf5ce9660ebf746f2ebe69bd54bd7"
+requires "libp2p == 2.3.1"
+requires "https://github.com/richard-ramos/nim-libp2p-mix#29eaaf1d6adb57fa95e70d0c577cf6c4855598d9"
+requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#4cb0b16f8a9f3d7e8b1e759e2179277fb6bbd519"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:
@@ -61,16 +59,6 @@ proc libExt(): string =
   elif defined(macosx): "dylib"
   else: "so"
 
-proc librlnLink(): string =
-  # librln.a is not a nimble package — it's a static archive produced by
-  # vacp2p/zerokit (Rust). LIBRLN_PATH must point at it; the build fails
-  # loudly rather than silently linking without it.
-  let p = getEnv("LIBRLN_PATH")
-  if p.len == 0:
-    raise newException(IOError,
-      "LIBRLN_PATH is unset; point it at librln.a from vacp2p/zerokit")
-  " --passL:" & p & " --passL:-lm"
-
 proc buildFfiLib() =
   let buildDir = "build"
   if not dirExists(buildDir):
@@ -79,7 +67,7 @@ proc buildFfiLib() =
     " --threads:on --app:lib --opt:size --noMain --mm:refc -d:metrics" &
     " -d:chronicles_runtime_filtering=on -d:ffiThreadExitTimeoutMs=5000" &
     " -d:libp2p_mix_experimental_exit_is_dest" &
-    librlnLink() & ffiDepPaths() &
+    ffiDepPaths() &
     " --nimMainPrefix:liblibp2p_mix_rln --nimcache:nimcache libp2p_mix_rln.nim"
 
 task buildffi, "Build the FFI shared library":
@@ -98,22 +86,13 @@ task genbindings_c, "Generate C bindings (c_bindings/libp2p_mix_rln.h)":
 task genbindings_cddl, "Generate CDDL schema":
   genBindingsFor("cddl", "cddl_bindings")
 
-# `nimble test` — runs every tests/*.nim.
-# The mix-routing integration test (no RLN) doesn't need librln, but our .nimble
-# transitively drags mix-rln-spam-protection-plugin in, which links against
-# librln. Skip the RLN link if a test doesn't reach those symbols by only
-# passing --passL when LIBRLN_PATH is set.
 task test, "Run integration tests":
   for f in listFiles("tests"):
     let (_, name, ext) = f.splitFile
     if ext != ".nim" or not name.startsWith("test_"):
       continue
-    var linkArgs = ""
-    let librln = getEnv("LIBRLN_PATH", "")
-    if librln.len > 0:
-      linkArgs = " --passL:" & librln & " --passL:-lm"
     exec "nim c -r --threads:on --mm:refc" &
       " -d:libp2p_mix_experimental_exit_is_dest" &
-      linkArgs & ffiDepPaths() &
+      ffiDepPaths() &
       " --nimcache:nimcache_" & name & " tests/" & name & ".nim"
     rmFile "tests/" & name.toExe
