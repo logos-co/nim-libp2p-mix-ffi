@@ -1,4 +1,4 @@
-{ pkgs, src, librln }:
+{ pkgs, src }:
 
 ## Runs tests/test_mix_routing.nim end-to-end: builds it with the same
 ## `--path:` args cbind.nix uses, then executes it as the derivation's
@@ -16,8 +16,6 @@ let
       (map (p: "--path:${p} --path:${p}/src")
            (builtins.attrValues cbindDeps));
 
-  librlnLinkArgs =
-    "--passL:${librln} --passL:-lm --passL:-lstdc++";
 in
 pkgs.stdenv.mkDerivation {
   pname = "nim-libp2p-mix-rln-ffi-test-mix-routing";
@@ -39,7 +37,6 @@ pkgs.stdenv.mkDerivation {
       --threads:on --mm:refc -d:release \
       -d:chronicles_runtime_filtering=on -d:chronicles_log_level=INFO \
       -d:libp2p_mix_experimental_exit_is_dest \
-      ${librlnLinkArgs} \
       --nimcache:$NIMCACHE -o:test_mix_routing \
       tests/test_mix_routing.nim
 

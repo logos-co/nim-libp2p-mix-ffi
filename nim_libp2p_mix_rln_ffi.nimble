@@ -59,16 +59,6 @@ proc libExt(): string =
   elif defined(macosx): "dylib"
   else: "so"
 
-proc librlnLink(): string =
-  # librln.a is not a nimble package — it's a static archive produced by
-  # vacp2p/zerokit (Rust). LIBRLN_PATH must point at it; the build fails
-  # loudly rather than silently linking without it.
-  let p = getEnv("LIBRLN_PATH")
-  if p.len == 0:
-    raise newException(IOError,
-      "LIBRLN_PATH is unset; point it at librln.a from vacp2p/zerokit")
-  " --passL:" & p & " --passL:-lm"
-
 proc buildFfiLib() =
   let buildDir = "build"
   if not dirExists(buildDir):
@@ -77,7 +67,7 @@ proc buildFfiLib() =
     " --threads:on --app:lib --opt:size --noMain --mm:refc -d:metrics" &
     " -d:chronicles_runtime_filtering=on -d:ffiThreadExitTimeoutMs=5000" &
     " -d:libp2p_mix_experimental_exit_is_dest" &
-    librlnLink() & ffiDepPaths() &
+    ffiDepPaths() &
     " --nimMainPrefix:liblibp2p_mix_rln --nimcache:nimcache libp2p_mix_rln.nim"
 
 task buildffi, "Build the FFI shared library":
@@ -96,22 +86,13 @@ task genbindings_c, "Generate C bindings (c_bindings/libp2p_mix_rln.h)":
 task genbindings_cddl, "Generate CDDL schema":
   genBindingsFor("cddl", "cddl_bindings")
 
-# `nimble test` — runs every tests/*.nim.
-# The mix-routing integration test (no RLN) doesn't need librln, but our .nimble
-# transitively drags mix-rln-spam-protection-plugin in, which links against
-# librln. Skip the RLN link if a test doesn't reach those symbols by only
-# passing --passL when LIBRLN_PATH is set.
 task test, "Run integration tests":
   for f in listFiles("tests"):
     let (_, name, ext) = f.splitFile
     if ext != ".nim" or not name.startsWith("test_"):
       continue
-    var linkArgs = ""
-    let librln = getEnv("LIBRLN_PATH", "")
-    if librln.len > 0:
-      linkArgs = " --passL:" & librln & " --passL:-lm"
     exec "nim c -r --threads:on --mm:refc" &
       " -d:libp2p_mix_experimental_exit_is_dest" &
-      linkArgs & ffiDepPaths() &
+      ffiDepPaths() &
       " --nimcache:nimcache_" & name & " tests/" & name & ".nim"
     rmFile "tests/" & name.toExe

@@ -1,12 +1,7 @@
-// 5-node end-to-end smoke test driven entirely through the C FFI.
-//
-// Spins up five LibMixRln contexts in one process, cross-registers their
-// mix peer records so each node's Sphinx path selector knows the others,
-// mounts a `/logosmix/test/echo/1.0.0` receiver on node C, and calls
-// `sendMixMessage(destPeerId=C, proto=/logosmix/test/echo/1.0.0,
-// isExitDest=true)` on node A. A→B→C route is then picked by the mix
-// protocol; C's mounted receiver fires the `onIncomingMixMessage` event
-// with the payload, which this test verifies matches what A sent.
+// Five-node C ABI test with a mock shared RLN backend.
+// Exercises callback transport, Sphinx routing, coordination, endpoint policy,
+// and SURB replies. The mock does not verify cryptography; the Logos module's
+// shared_delivery_mix fixture covers real proofs and registry memberships.
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -229,9 +224,78 @@ static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     (void)libp2p_mix_rln_ctx_send_mix_surb_reply(s->ctx, &req, on_surb_reply, s);
 }
 
+// Nonblocking replies re-enter through the FFI queue, never wait on its event loop.
+typedef struct {
+    LibMixRlnCtx* ctx;
+    int index;
+} MockBackend;
+
+static atomic_int backend_errors;
+static atomic_uint proof_serial;
+static atomic_uint verified_proofs;
+
+static void field_hex(char out[65], uint64_t value) {
+    memset(out, '0', 64);
+    for (int i = 0; i < 8; i++)
+        snprintf(out + i * 2, 3, "%02x", (unsigned)((value >> (i * 8)) & 255));
+    memset(out + 16, '0', 48);
+    out[64] = '\0';
+}
+
+static void on_backend_response(int ec, const bool* reply, const char* em, void* ud) {
+    (void)ud;
+    if (ec || !reply || !*reply) {
+        fprintf(stderr, "backend response failed: %s\n", em ? em : "false reply");
+        atomic_fetch_add(&backend_errors, 1);
+    }
+}
+
+static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
+    MockBackend* backend = ud;
+    char method[64], body[1200];
+    snprintf(method, sizeof(method), "%.*s", (int)evt->methodName.len, evt->methodName.data);
+    if (strcmp(method, "get_registry_parameters") == 0) {
+        snprintf(body, sizeof(body), "{\"epoch_size_sec\":10}");
+    } else if (strcmp(method, "register_membership") == 0 ||
+               strcmp(method, "get_membership_state") == 0) {
+        snprintf(body, sizeof(body), "{\"state\":\"active\",\"leaf_index\":%d}", backend->index);
+    } else if (strcmp(method, "generate_proof") == 0) {
+        // The final scoped argument is the timestamp requested by the adapter.
+        char* args = strndup(evt->argsJson.data, evt->argsJson.len);
+        char* timestamp = strrchr(args, ',');
+        if (!timestamp) abort();
+        do { timestamp++; } while (*timestamp == ' ' || *timestamp == '"');
+        char epoch[65], serial[65], zero[65], proof[257];
+        field_hex(epoch, strtoull(timestamp, NULL, 10) / 10);
+        field_hex(serial, atomic_fetch_add(&proof_serial, 1) + 1);
+        field_hex(zero, 0);
+        memset(proof, '0', 256); proof[256] = '\0';
+        snprintf(body, sizeof(body),
+                 "{\"proof\":\"%s\",\"root\":\"%s\",\"epoch\":\"%s\","
+                 "\"share_x\":\"%s\",\"share_y\":\"%s\",\"nullifier\":\"%s\"}",
+                 proof, zero, epoch, serial, serial, serial);
+        free(args);
+    } else if (strcmp(method, "validate_proof") == 0) {
+        char zero[65]; field_hex(zero, 0);
+        snprintf(body, sizeof(body), "{\"verdict\":\"valid\",\"external_nullifier\":\"%s\"}", zero);
+        atomic_fetch_add(&verified_proofs, 1);
+    } else {
+        fprintf(stderr, "unexpected backend method: %s\n", method);
+        abort();
+    }
+    RlnModuleResponse response = {.requestId = evt->requestId, .responseJson = nimffi_str(body)};
+    if (libp2p_mix_rln_ctx_rln_response(backend->ctx, &response, on_backend_response, NULL))
+        atomic_fetch_add(&backend_errors, 1);
+}
+
 // -------- node builder ----------------------------------------------------
 
 static int check_create_config(MixRlnConfig cfg) {
+    MixRlnConfig missing_scope = cfg;
+    missing_scope.rln.registryId = nimffi_str("");
+    Waiter missing; waiter_init(&missing);
+    (void)libp2p_mix_rln_ctx_create(&missing_scope, on_created, &missing);
+    if (waiter_wait(&missing, 60) || !missing.err_code || missing.ctx) return -1;
     const char* bad_keys[] = {"not-hex", "01", "0000000000000000000000000000000000000000000000000000000000000000"};
     for (size_t i = 0; i < sizeof(bad_keys) / sizeof(bad_keys[0]); i++) {
         cfg.privKeyHex = nimffi_str(bad_keys[i]);
@@ -278,10 +342,11 @@ static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transpo
     cfg.mix.allowSend = allow_send;
     cfg.mix.allowExit = allow_exit;
     cfg.mix.coverRateFraction = 0.01;
-    cfg.rln.epochDurationSeconds = 1;
-    cfg.rln.maxEpochGap = 20;
+    cfg.rln.registryId = nimffi_str("logos:local:ffi-test");
+    cfg.rln.rlnIdentifierHex = nimffi_str("6d69782d726c6e2d7370616d2d70726f74656374696f6e2f7631000000000000");
+    cfg.rln.epochDurationSeconds = 10;
+    cfg.rln.maxEpochGap = 3;
     cfg.rln.userMessageLimit = 100;
-    cfg.rln.membershipContentTopic = nimffi_str("/mix/rln/membership/v1");
     cfg.rln.proofMetadataContentTopic = nimffi_str("/mix/rln/metadata/v1");
 
     static bool config_checked = false;
@@ -501,10 +566,14 @@ int main(void) {
         ? "/ip4/127.0.0.1/udp/0/quic-v1" : "/ip4/127.0.0.1/tcp/0";
     fprintf(stderr, "[smoke] transport=%s\n", transport);
     LibMixRlnCtx* nodes[N];
+    MockBackend backends[N];
     MixPeerRecord recs[N];
     for (int i = 0; i < N; i++) {
         nodes[i] = make_node(listen_multiaddr, transport, i == 0 || i == N - 1, i == N - 1);
         if (!nodes[i]) { fprintf(stderr, "node[%d] create failed\n", i); return 1; }
+        backends[i] = (MockBackend){.ctx = nodes[i], .index = i};
+        (void)libp2p_mix_rln_ctx_add_on_rln_module_request_listener(
+            nodes[i], on_backend_request, &backends[i]);
     }
     fprintf(stderr, "[smoke] %d nodes created\n", N);
 
@@ -578,7 +647,7 @@ int main(void) {
             return 1;
         }
     }
-    fprintf(stderr, "[smoke] all RLN memberships registered through host coordination\n");
+    fprintf(stderr, "[smoke] all memberships registered through the mock shared backend\n");
 
     // A default intermediate must reject every endpoint API, before parsing
     // destination/SURB input or consuming a rate-limit slot.
@@ -688,5 +757,7 @@ int main(void) {
     for (int i = 0; i < N; i++) (void)stop_node(nodes[i]);
     for (int i = 0; i < N; i++) libp2p_mix_rln_ctx_destroy(nodes[i]);
     for (int i = 0; i < N; i++) free_record(&recs[i]);
+    if (atomic_load(&backend_errors) || !atomic_load(&proof_serial) ||
+        !atomic_load(&verified_proofs)) return 1;
     return 0;
 }

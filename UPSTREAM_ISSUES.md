@@ -6,46 +6,6 @@ Reported by: [your GitHub handle], during work on
 
 ---
 
-## 1. `vacp2p/zerokit` — flake fails at cargo-vendor step: crates.io 403
-
-**File in:** https://github.com/vacp2p/zerokit/issues
-
-### Title
-`nix build .#rln` fails: crates.io 403 on empty User-Agent from pinned nixpkgs' `fetch-cargo-vendor-util`
-
-### Body
-Any downstream flake that consumes `zerokit.packages.<system>.rln` fails at
-the `zerokit-3.0.0-vendor-staging` derivation with:
-
-```
-Exception: Failed to fetch file from https://crates.io/api/v1/crates/colorchoice/1.0.5/download. Status code: 403
-```
-
-**Root cause:** `flake.nix` pins nixpkgs at rev
-`23d72dabcb3b12469f57b37170fcbc1789bd7457` (release-25.11). At that revision,
-`nixpkgs/pkgs/build-support/rust/fetch-cargo-vendor-util` makes HTTP requests
-to crates.io without a `User-Agent` header, and crates.io now rejects
-empty-UA requests with 403.
-
-Reproduction with plain curl (bypasses nix entirely):
-
-```
-$ curl -so /dev/null -w '%{http_code}\n' https://crates.io/api/v1/crates/colorchoice/1.0.5/download
-403
-$ curl -so /dev/null -w '%{http_code}\n' -A 'any-ua' https://crates.io/api/v1/crates/colorchoice/1.0.5/download
-302
-```
-
-**Impact:** Nobody can build `librln.a` through zerokit's flake at the moment.
-(Local `cargo build --release --lib` in `zerokit/rln/` works fine — produces
-a 42 MB `librln.a` in about 40 s. So the problem is exclusive to the nix
-build path.)
-
-**Suggested fix:** Bump the `nixpkgs` input to a post-2026-03 revision of
-`nixpkgs-unstable` where `fetch-cargo-vendor-util` sets a `User-Agent`.
-
----
-
 ## 2. `vacp2p/nim-libp2p` — `cbind` nim-ffi SHA is unfetchable
 
 **File in:** https://github.com/vacp2p/nim-libp2p/issues
@@ -215,31 +175,6 @@ authors to either fork the module or leave features stubbed:
    That blocks implementing `sendSurbReply` outside the module.
 
 Happy to write PRs for any of these if you can confirm the shape you want.
-
----
-
-## 5b. `logos-co/mix-rln-spam-protection-plugin` — no public Merkle root accessor
-
-**File in:** https://github.com/logos-co/mix-rln-spam-protection-plugin/issues
-
-### Title
-`MixRlnSpamProtection.getMembershipIndex()` exists; matching Merkle-root accessor doesn't
-
-### Body
-`MixRlnSpamProtection` exposes `getMembershipIndex(): Option[MembershipIndex]`
-(public), but there's no matching public accessor for the current Merkle
-root. LIP LOGOS-MIXNET §… requires exposing the acceptable-root window
-(default 5) so that hosts can, e.g., emit a
-`RlnMembershipRegistered{ index, root }` event or verify inbound proofs
-against a specific historical root.
-
-Right now the root is reachable only via `groupManager` internals.
-
-**Suggested fix:** Add a public method like:
-```nim
-proc getMembershipRoot(sp: MixRlnSpamProtection): Option[seq[byte]]
-```
-and, ideally, an iterator over the acceptable-root window.
 
 ---
 

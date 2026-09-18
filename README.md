@@ -22,17 +22,14 @@ receiving node independently enforces its own exit policy.
 
 ## Status
 
-The following end-to-end checks cover the legacy embedded provider.
-Shared-provider network validation is tracked in the Logos module work summary:
+The C smoke test runs five nodes over TCP and QUIC using a mock shared RLN
+backend. It covers asynchronous callback transport, endpoint restrictions,
+Sphinx routing, metadata coordination, and SURB replies. The mock does not
+perform cryptography.
 
-- Standalone C smoke test: `nim-libp2p-mix-rln-ffi-smoketest-3node-ffi`
-  drives 5 nodes purely through the C API, synchronizes membership through
-  the host coordination callbacks, pings across a Sphinx circuit, and round-trips per-hop RLN
-  proofs.
-- Nim integration test: `test_mix_routing_rln` — same but composed
-  in-process, useful for iterating on the composition.
-- Multi-node e2e through the C++ Logos Core module — see
-  [logos-libp2p-mix-rln][logos-mod].
+Real shared-backend proofs, funded memberships, Delivery interoperability, and
+no-direct-fallback behavior are exercised by the seven-host
+[Logos module fixture](https://github.com/logos-co/logos-libp2p-mix-rln/tree/feat/standalone-mix-intermediate/tests/integration_e2e/shared_delivery_mix).
 
 ## Build (nix, hermetic)
 
@@ -42,17 +39,14 @@ nix build .#cbind
 # → result/include/libp2p_mix_rln.h + tinycbor/
 ```
 
-`flake.nix` pins `zerokit` at the [`richard-ramos/zerokit#nix-rln-stateless`][fork-branch]
-branch (source of [zerokit PR #436][zerokit-pr] — draft against v2.x, not
-for merge; see the PR for why) so no override is needed. Repoint to
-`vacp2p/zerokit` once those nix packaging changes land upstream.
+The facade does not link a local RLN cryptography library. Its host must
+provide `liblogos_rln_module` and service the asynchronous proof requests.
 
 ## Tests
 
 ```sh
 nix build .#test-mix-routing         # 5-node Sphinx circuit (no RLN)
-nix build .#test-mix-routing-rln     # same, with per-hop RLN
-nix build .#smoketest-3node-ffi      # C-level 5-node libp2p/Mix/RLN test
+nix build .#smoketest-3node-ffi      # C routing test with a mock shared backend
 ```
 
 ## What's real vs. stubbed
@@ -65,26 +59,25 @@ Real, exercised at runtime:
 - `getNodeInfo(Version | PeerId | Multiaddrs | MixPublicKey)`.
 - Multi-node topology: `getLocalMixPeerRecord`, `addMixPeer`, and
   `mountReceiver`; intermediate hops require no application receiver.
-- Events: `onIncomingMixMessage`, `onRlnMembershipRegistered`, and
+- Events: `onIncomingMixMessage`, `onRlnModuleRequest`, and
   `onRlnPublishRequested`.
 - SURB replies, membership-index lookup and live cover-rate updates.
 
-The host must subscribe to `onRlnPublishRequested` before registering
-memberships, publish the topic and bytes through its coordination transport,
+The host must subscribe to `onRlnPublishRequested` before starting traffic,
+publish the topic and bytes through its coordination transport,
 and inject received frames with `deliverCoordFrame`. Dispatch transport calls
 outside the FFI callback. `addMixPeer` only installs a routing record; it does
 not connect the external coordination transport. TCP and QUIC both bind on
-Mix's own switch. Proof generation uses the selected provider.
+Mix's own switch. Proof generation always uses the shared backend.
 
 Service discovery is not wired: `listMixPeers` reports the manually populated
 pool. Shared-provider membership synchronization belongs to the registry backend.
 
 ## Shared RLN provider
 
-Set `RlnConfig.provider="module"`, `registryId`, and `rlnIdentifierHex` to use
-`liblogos_rln_module`. Configure matching epochs, accepted gap, and metadata
-topic on all participants. The Logos wrapper defaults to this provider; an
-empty FFI provider retains embedded behavior for existing C callers.
+Set `registryId` and `rlnIdentifierHex` in `RlnConfig`. Configure matching
+epochs, accepted gap, and metadata topic on all participants. There is no
+provider selector or embedded fallback.
 
 Before starting the node, start the backend and arrange active scoped
 memberships. Subscribe to `RlnModuleRequestEvent`, forward its `methodName`
@@ -100,10 +93,11 @@ announcements. `registerRlnMembership` submits registration options to the
 backend; callers must observe activation before generating proofs. Shutdown
 cancels pending backend requests; late responses are rejected.
 
-The embedded provider remains for transition tests. Its cryptographic version
-and external-nullifier construction differ from shared mode; do not mix these
-providers in one network. The shared adapter is used by native Delivery Mix
-as well as this facade.
+The shared adapter is used by native Delivery Mix as well as this facade.
+Consumers must rebuild against the generated C header: the provider selector,
+local keystore/tree/resource settings, membership topic, and local membership
+registration event have been removed. Observe membership activation through
+the backend or the membership query API.
 
 ## Layout
 
@@ -116,8 +110,7 @@ nim-libp2p-mix-rln-ffi/
 │   ├── cbind.nix                  # hermetic build derivation
 │   ├── cbind-deps.nix             # pinned deps from nimble.lock
 │   ├── smoketest-3node-ffi.nix    # C smoke test derivation
-│   ├── test-mix-routing.nix       # 5-node Sphinx test (no RLN)
-│   └── test-mix-routing-rln.nix   # 5-node Sphinx test with RLN
+│   └── test-mix-routing.nix       # 5-node Sphinx test (no RLN)
 ├── tools/regen-cbind-deps.py      # regenerate cbind-deps.nix after bumping pins
 ├── flake.nix                      # outputs packages.<system>.{cbind,tests}
 ├── tests/                         # Nim + C integration tests
@@ -131,13 +124,9 @@ nim-libp2p-mix-rln-ffi/
 ## Local (non-nix) build
 
 ```sh
-export LIBRLN_PATH=/path/to/librln.a          # from vacp2p/zerokit
-nimble -l setup -y
-nim c -d:libp2p_mix_experimental_exit_is_dest \
-      --app:lib --threads:on --mm:refc \
-      --passL:$LIBRLN_PATH --passL:-lm \
-      -o:build/liblibp2p_mix_rln.so \
-      libp2p_mix_rln.nim
+make setup
+make buildffi
+make genbindings
 ```
 
 [libp2p]: https://github.com/vacp2p/nim-libp2p
@@ -145,6 +134,3 @@ nim c -d:libp2p_mix_experimental_exit_is_dest \
 [mix-rln]: https://github.com/logos-co/mix-rln-spam-protection-plugin
 [logos-mod]: https://github.com/logos-co/logos-libp2p-mix-rln
 [nim-ffi]: https://github.com/logos-messaging/nim-ffi
-[zerokit]: https://github.com/vacp2p/zerokit
-[zerokit-pr]: https://github.com/vacp2p/zerokit/pull/436
-[fork-branch]: https://github.com/richard-ramos/zerokit/tree/nix-rln-stateless

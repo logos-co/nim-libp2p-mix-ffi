@@ -6,7 +6,7 @@
 ## consumers construct a `MixRlnConfig` from CBOR-marshalled fields.
 ##
 ## LIP LOGOS-MIXNET parameters that the spec fixes (path length 3, Sphinx
-## packet 4908 bytes, `CONSTANT_RATE` cover strategy) are NOT exposed here —
+## packet plus proof 4909 bytes, `CONSTANT_RATE` cover strategy) are NOT exposed here —
 ## they are compile-time constants inside the mix protocol.
 ##
 ## Parameters marked `TBD` in LIP LOGOS-MIXNET carry placeholder defaults —
@@ -21,18 +21,12 @@ type MixConfig* {.ffi.} = object
   coverRateFraction: float64 ## LIP LOGOS-MIXNET default: 0.7.
 
 type RlnConfig* {.ffi.} = object
-  provider: string ## "module" or the transitional "embedded" test backend.
   registryId: string
   rlnIdentifierHex: string
   registrationOptionsJson: string
-  keystorePath: string
-  keystorePassword: string
-  treePath: string
-  rlnResourcesPath: string
-  epochDurationSeconds: int64 ## TBD; placeholder default 1.
-  maxEpochGap: int ## TBD; placeholder default 20.
-  userMessageLimit: int ## TBD; placeholder default 100.
-  membershipContentTopic: string ## Placeholder "/mix/rln/membership/v1".
+  epochDurationSeconds: int64 ## Must match the backend; Logos profile: 10.
+  maxEpochGap: int ## Logos profile: 3.
+  userMessageLimit: int ## Logos profile: 100.
   proofMetadataContentTopic: string ## Placeholder "/mix/rln/metadata/v1".
 
 type MixRlnConfig* {.ffi.} = object ## Top-level config passed to `libp2pMixRlnCreate`.

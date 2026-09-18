@@ -1,11 +1,8 @@
-{ pkgs, src, librln }:
+{ pkgs, src }:
 
 ## Hermetic build of the FFI shared library + generated C header.
 ##
-## Uses pinned libp2p, Mix, RLN and FFI dependencies and a mandatory `librln.a` input.
-##
-## `librln`: path to the librln.a static archive from vacp2p/zerokit. Passed in
-## from the flake so packaging zerokit stays out of scope here.
+## Uses pinned libp2p, Mix, shared RLN adapter and FFI dependencies.
 
 let
   cbindDeps = import ./cbind-deps.nix { inherit pkgs; };
@@ -26,8 +23,6 @@ let
 
   tinycborVendor = "${cbindDeps.ffi}/ffi/codegen/templates/cpp/vendor/tinycbor";
 
-  librlnLinkArgs =
-    "--passL:${librln} --passL:-lm";
 in
 pkgs.stdenv.mkDerivation {
   pname = "nim-libp2p-mix-rln-ffi-cbind";
@@ -54,8 +49,7 @@ pkgs.stdenv.mkDerivation {
       -d:chronicles_runtime_filtering=on \
       -d:ffiThreadExitTimeoutMs=5000 \
       -d:libp2p_mix_experimental_exit_is_dest \
-      --nimMainPrefix:liblibp2p_mix_rln --nimcache:$NIMCACHE \
-      ${librlnLinkArgs}"
+      --nimMainPrefix:liblibp2p_mix_rln --nimcache:$NIMCACHE"
 
     echo "== Building FFI library (dynamic/shared) =="
     nim c $commonArgs --app:lib --out:build/liblibp2p_mix_rln.${libExt} libp2p_mix_rln.nim
