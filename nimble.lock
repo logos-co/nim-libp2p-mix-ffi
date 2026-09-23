@@ -381,8 +381,8 @@
       }
     },
     "libp2p_mix": {
-      "version": "#6c9ed6138422080765462754e5aa4fa6c974b662",
-      "vcsRevision": "6c9ed6138422080765462754e5aa4fa6c974b662",
+      "version": "#c6783dafa68ddbc7d8c8acfca4ad46f49de1c3f9",
+      "vcsRevision": "c6783dafa68ddbc7d8c8acfca4ad46f49de1c3f9",
       "url": "https://github.com/richard-ramos/nim-libp2p-mix",
       "downloadMethod": "git",
       "dependencies": [
