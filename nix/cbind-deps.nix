@@ -74,8 +74,8 @@
 
   libp2p_mix = pkgs.fetchgit {
     url = "https://github.com/richard-ramos/nim-libp2p-mix";
-    rev = "29eaaf1d6adb57fa95e70d0c577cf6c4855598d9";
-    sha256 = "1kk3bs5fhbxb8z6q1590lkjm1w5b85v9z1wcypxs0wa49d0ac27b";
+    rev = "f544aead115d0f79b2189f7153b3d07291a822dc";
+    sha256 = "118x0pcygrdp0mrimnqqw1svd1i7sl1h1k189fxqc16cqil1v7kp";
     fetchSubmodules = true;
   };
 

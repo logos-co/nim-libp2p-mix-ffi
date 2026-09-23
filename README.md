@@ -14,11 +14,10 @@ for pragma-driven codegen of the C header.
 Application endpoint capabilities are opt-in: `MixConfig.allowSend` and
 `MixConfig.allowExit` both default to false. `allowSend` gates application
 sends and explicit SURB replies; `allowExit` gates receiver mounting and
-local/external exit delivery. Intermediate forwarding and cover loops
-remain active. Set both flags for an endpoint that receives and explicitly
-replies. `MixPeerRecord.exitEnabled` advertises exit eligibility; preserve
-it when copying records. Senders select only advertised exits, while each
-receiving node independently enforces its own exit policy.
+application delivery. Intermediate forwarding and cover loops remain active.
+Set both flags for an endpoint that receives and explicitly replies. The FFI
+only exposes exit-equals-destination sends; peer records therefore carry no
+separate exit capability.
 
 ## Status
 
@@ -54,7 +53,8 @@ nix build .#smoketest-3node-ffi      # C routing test with a mock shared backend
 Real, exercised at runtime:
 - Full lifecycle (`create` / `start` / `stop` / `destroy`).
 - `sendMixMessage` — Sphinx-routed writeLp, optional SURB reply.
-- `sendMixMessageToExit` — exit-is-dest routing, no exit multiaddr needed.
+- `sendMixMessage` always uses exit-is-destination routing; no destination
+  multiaddr or mode flag is exposed.
 - `registerRlnMembership` / `hasRlnMembership`.
 - `getNodeInfo(Version | PeerId | Multiaddrs | MixPublicKey)`.
 - Multi-node topology: `getLocalMixPeerRecord`, `addMixPeer`, and

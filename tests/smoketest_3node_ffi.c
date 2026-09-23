@@ -142,7 +142,6 @@ static void on_peer_record(int ec, const MixPeerRecord* r,
     w->err_code = ec;
     if (r) {
         memset(&w->rec, 0, sizeof(w->rec));
-        w->rec.exitEnabled = r->exitEnabled;
         // peerId
         w->rec.peerId.data = strndup(r->peerId.data ? r->peerId.data : "",
                                      r->peerId.data ? r->peerId.len : 0);
@@ -667,10 +666,7 @@ int main(void) {
     (void)libp2p_mix_rln_ctx_mount_receiver(A, &denied_receiver, on_bool, &denied_mount);
     if (waiter_wait(&denied_mount, 10) || denied_mount.err_code == 0 ||
         !strstr(denied_mount.err_msg, "mix.allowExit")) return 1;
-    for (int i = 0; i < N; i++) {
-        if (recs[i].exitEnabled != (i == N - 1)) return 1;
-    }
-    fprintf(stderr, "[smoke] default endpoint denial and exit advertisements verified\n");
+    fprintf(stderr, "[smoke] default endpoint denial verified\n");
 
     // Mount receiver on C.
     MountReceiverRequest mreq;
@@ -700,14 +696,12 @@ int main(void) {
     MixSendRequest sr;
     memset(&sr, 0, sizeof(sr));
     sr.destPeerId    = recC->peerId;
-    sr.destMultiaddr = nimffi_str("");
     sr.proto         = nimffi_str(kTestCodec);
     sr.payload.data  = (uint8_t*)kTestPayload;
     sr.payload.len   = strlen(kTestPayload);
     sr.expectReply   = true;
     sr.numSurbs      = 1;
     sr.timeoutMs     = 15000;
-    sr.isExitDest    = true;
 
     Waiter sw; waiter_init(&sw);
     fprintf(stderr, "[smoke] sending mix message from A to C\n");
