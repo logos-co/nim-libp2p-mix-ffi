@@ -11,13 +11,11 @@ C++/Qt Logos Core module.
 Modelled on `vacp2p/nim-libp2p`'s `cbind` package. Uses [nim-ffi][nim-ffi]
 for pragma-driven codegen of the C header.
 
-Application endpoint capabilities are opt-in: `MixConfig.allowSend` and
-`MixConfig.allowExit` both default to false. `allowSend` gates application
-sends and explicit SURB replies; `allowExit` gates receiver mounting and
-application delivery. Intermediate forwarding and cover loops remain active.
-Set both flags for an endpoint that receives and explicitly replies. The FFI
-only exposes exit-equals-destination sends; peer records therefore carry no
-separate exit capability.
+Nodes can send application messages, send explicit SURB replies, and act as
+exits by default. Applications mount receivers for local protocol delivery;
+forwarding and cover traffic remain active without a receiver. The FFI only
+exposes exit-equals-destination sends, and peer records carry no separate exit
+capability.
 
 ## Status
 
