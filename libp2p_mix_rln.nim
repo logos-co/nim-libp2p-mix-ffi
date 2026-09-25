@@ -165,9 +165,6 @@ type MixSurbReplyRequest {.ffi.} = object
 type CoverRateResponse {.ffi.} = object
   rate: float64
 
-type SetCoverRateRequest {.ffi.} = object
-  rate: float64
-
 type MixPeerEntry {.ffi.} = object
   peerId: string
   multiaddrs: seq[string]
@@ -723,13 +720,6 @@ proc libp2pMixRlnGetCoverTrafficRate*(
     lib: LibMixRln
 ): Future[Result[CoverRateResponse, string]] {.ffi.} =
   ok(CoverRateResponse(rate: lib.coverTraffic.coverRateFraction()))
-
-proc libp2pMixRlnSetCoverTrafficRate*(
-    lib: LibMixRln, req: SetCoverRateRequest
-): Future[Result[bool, string]] {.ffi.} =
-  (await lib.coverTraffic.setCoverRateFraction(req.rate)).isOkOr:
-    return err(error)
-  ok(true)
 
 # ----------------------------------------------------------------------------
 # Emit the C header.
