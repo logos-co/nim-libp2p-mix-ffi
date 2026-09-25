@@ -329,7 +329,7 @@ static int check_create_config(MixRlnConfig cfg) {
     return waiter_wait(&w, 60) || !w.err_code || w.ctx ? -1 : 0;
 }
 
-static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transport, bool allow_send, bool allow_exit) {
+static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transport) {
     NimFfiStr addr = nimffi_str(listen_multiaddr);
     MixRlnConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -338,8 +338,6 @@ static LibMixRlnCtx* make_node(const char* listen_multiaddr, const char* transpo
     cfg.transport = nimffi_str(transport);
     cfg.maxConnections = 50;
     cfg.maxConnsPerPeer = 2;
-    cfg.mix.allowSend = allow_send;
-    cfg.mix.allowExit = allow_exit;
     cfg.mix.coverRateFraction = 0.01;
     cfg.rln.registryId = nimffi_str("logos:local:ffi-test");
     cfg.rln.rlnIdentifierHex = nimffi_str("6d69782d726c6e2d7370616d2d70726f74656374696f6e2f7631000000000000");
@@ -568,7 +566,7 @@ int main(void) {
     MockBackend backends[N];
     MixPeerRecord recs[N];
     for (int i = 0; i < N; i++) {
-        nodes[i] = make_node(listen_multiaddr, transport, i == 0 || i == N - 1, i == N - 1);
+        nodes[i] = make_node(listen_multiaddr, transport);
         if (!nodes[i]) { fprintf(stderr, "node[%d] create failed\n", i); return 1; }
         backends[i] = (MockBackend){.ctx = nodes[i], .index = i};
         (void)libp2p_mix_rln_ctx_add_on_rln_module_request_listener(
@@ -648,27 +646,7 @@ int main(void) {
     }
     fprintf(stderr, "[smoke] all memberships registered through the mock shared backend\n");
 
-    // A default intermediate must reject every endpoint API, before parsing
-    // destination/SURB input or consuming a rate-limit slot.
-    MixSendRequest denied_send = {0};
-    Waiter denied; waiter_init(&denied);
-    (void)libp2p_mix_rln_ctx_send_mix_message(nodes[1], &denied_send, on_mix_send, &denied);
-    if (waiter_wait(&denied, 10) || denied.err_code == 0 ||
-        !strstr(denied.err_msg, "mix.allowSend")) return 1;
-    MixSurbReplyRequest denied_reply = {0};
-    Waiter denied_surb; waiter_init(&denied_surb);
-    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(nodes[1], &denied_reply, on_bool, &denied_surb);
-    if (waiter_wait(&denied_surb, 10) || denied_surb.err_code == 0 ||
-        !strstr(denied_surb.err_msg, "mix.allowSend")) return 1;
-    MountReceiverRequest denied_receiver = {0};
-    // Sender-only node also cannot mount an exit receiver.
-    Waiter denied_mount; waiter_init(&denied_mount);
-    (void)libp2p_mix_rln_ctx_mount_receiver(A, &denied_receiver, on_bool, &denied_mount);
-    if (waiter_wait(&denied_mount, 10) || denied_mount.err_code == 0 ||
-        !strstr(denied_mount.err_msg, "mix.allowExit")) return 1;
-    fprintf(stderr, "[smoke] default endpoint denial verified\n");
-
-    // Mount receiver on C.
+    // Default nodes can mount receivers, send requests, and reply with SURBs.
     MountReceiverRequest mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.codec = nimffi_str(kTestCodec);

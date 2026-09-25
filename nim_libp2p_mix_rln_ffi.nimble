@@ -21,7 +21,7 @@ requires "taskpools >= 0.1.0"
 requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
 requires "libp2p == 2.3.1"
-requires "https://github.com/richard-ramos/nim-libp2p-mix#c6783dafa68ddbc7d8c8acfca4ad46f49de1c3f9"
+requires "https://github.com/richard-ramos/nim-libp2p-mix#b93b59bedc39f203f07cab5aa5db507d53eeca76"
 requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#4cb0b16f8a9f3d7e8b1e759e2179277fb6bbd519"
 
 # Build tasks --------------------------------------------------------------

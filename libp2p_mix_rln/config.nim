@@ -16,8 +16,6 @@ type MixConfig* {.ffi.} = object
   ## X25519 keypair advertised for Sphinx path selection is embedded here.
   ## `mixPrivKeyHex = ""` → generate on create.
   mixPrivKeyHex: string
-  allowSend: bool ## Opt in to application sends, including explicit SURB replies.
-  allowExit: bool ## Opt in to application exit delivery. Cover loops are unaffected.
   coverRateFraction: float64 ## LIP LOGOS-MIXNET default: 0.7.
 
 type RlnConfig* {.ffi.} = object

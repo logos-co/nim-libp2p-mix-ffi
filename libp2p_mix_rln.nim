@@ -99,8 +99,6 @@ type LibMixRln* = ref object
   rlnRequests: RlnRequests
   registrationOptions: string
   transport: string
-  allowSend: bool
-  allowExit: bool
   running: bool
   stopped: bool
 
@@ -352,13 +350,10 @@ proc libp2pMixRlnCreate*(
     spamProtection = Opt.some(SpamProtection(moduleRln)),
     delayStrategy = Opt.some(DelayStrategy(SpamProtectionDelayStrategy.new(rng = rng))),
     coverTraffic = Opt.some(CoverTraffic(coverTraffic)),
-    allowExit = cfg.mix.allowExit,
   )
   switch.mount(proto)
   ok(
     LibMixRln(
-      allowSend: cfg.mix.allowSend,
-      allowExit: cfg.mix.allowExit,
       switch: switch,
       mixProto: proto,
       coverTraffic: coverTraffic,
@@ -519,8 +514,6 @@ proc libp2pMixRlnSendMixMessage*(
   ## Sends `req.payload` through a Sphinx circuit to the exit destination,
   ## which will unwrap and hand it to `req.proto` on the destination node.
   ## Logos supports exit == destination only.
-  if not lib.allowSend:
-    return err("Application sending disabled; set mix.allowSend=true")
   let destPid = PeerId.init(req.destPeerId).valueOr:
     return err("invalid destPeerId: " & $error)
 
@@ -577,8 +570,6 @@ proc serializeSurb(surb: SURB): seq[byte] =
 proc libp2pMixRlnSendMixSurbReply*(
     lib: LibMixRln, req: MixSurbReplyRequest
 ): Future[Result[bool, string]] {.ffi.} =
-  if not lib.allowSend:
-    return err("Application sending disabled; set mix.allowSend=true")
   let decoded = extractSURBs(@[1.byte] & req.surb).valueOr:
     return err("invalid SURB: " & error)
   let (surbs, trailing) = decoded
@@ -689,8 +680,6 @@ proc libp2pMixRlnMountReceiver*(
   ## event with the payload, and closes. Also registers a
   ## `readLp(maxSize)` DestReadBehavior on the mix protocol so exit-is-dest
   ## replies frame correctly.
-  if not lib.allowExit:
-    return err("Application exit delivery disabled; set mix.allowExit=true")
   let maxSize =
     if req.maxSize > 0:
       int(req.maxSize)
