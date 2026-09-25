@@ -24,6 +24,7 @@ import libp2p/[multiaddress, peerid, switch, varint, builders]
 import libp2p/crypto/[crypto, secp]
 import libp2p/crypto/curve25519 as lp_curve25519
 import libp2p/stream/[connection, lpstream]
+import stew/endians2
 
 # nim-libp2p-mix — Sphinx routing + mix protocol.
 import libp2p_mix
@@ -39,7 +40,51 @@ import libp2p/protocols/protocol as lp_protocol
 import stew/byteutils
 
 # mix-rln-spam-protection-plugin — per-hop RLN proof gen/verify.
-import mix_rln_spam_protection/[module_api, module_transport]
+import mix_rln_spam_protection/[module_api, module_transport, types, codec]
+
+proc decodeRlnField[N: static int](
+    obj: JsonNode, key: string
+): Result[array[N, byte], string] =
+  if obj.isNil or obj.kind != JObject or not obj.hasKey(key) or
+      obj.getOrDefault(key).kind != JString:
+    return err("Missing RLN field: " & key)
+  try:
+    let bytes = hexToSeqByte(obj.getOrDefault(key).getStr())
+    if bytes.len != N:
+      return err("Invalid RLN field size: " & key)
+    var field: array[N, byte]
+    for i in 0 ..< N:
+      field[i] = bytes[i]
+    return ok(field)
+  except ValueError:
+    return err("Invalid RLN field hex: " & key)
+
+method generateProofAsync*(
+    sp: ModuleRlnProtection, bindingData: seq[byte], epoch: uint64
+): Future[Result[ProofResult, string]] {.async: (raises: [CancelledError]).} =
+  if sp.config.epochSeconds == 0 or epoch > high(uint64) div sp.config.epochSeconds:
+    return err("Invalid RLN proof epoch")
+  let timestamp = epoch * sp.config.epochSeconds
+  let response = (
+    await sp.scopedCall(
+      "generate_proof", %*[byteutils.toHex(bindingData), $timestamp]
+    )
+  ).valueOr:
+    return err(error)
+  let proof = RateLimitProof(
+    proof: ?decodeRlnField[128](response, "proof"),
+    merkleRoot: ?decodeRlnField[32](response, "root"),
+    epoch: ?decodeRlnField[32](response, "epoch"),
+    shareX: ?decodeRlnField[32](response, "share_x"),
+    shareY: ?decodeRlnField[32](response, "share_y"),
+    nullifier: ?decodeRlnField[32](response, "nullifier"),
+  )
+  if uint64.fromBytesLE(proof.epoch.toOpenArray(0, 7)) != epoch:
+    return err("RLN backend returned a proof for a different epoch")
+  let encoded = proof.toBytes()
+  discard RateLimitProof.decode(encoded).valueOr:
+    return err("RLN backend returned a malformed proof: " & $error)
+  return ok(ProofResult(proof: encoded, token: @(proof.epoch)))
 
 # LibMixRln ------------------------------------------------------------------
 
@@ -55,6 +100,7 @@ type LibMixRln* = ref object
   registrationOptions: string
   transport: string
   allowSend: bool
+  allowExit: bool
   running: bool
   stopped: bool
 
@@ -86,24 +132,13 @@ type NodeInfoResponse {.ffi.} = object
 
 type MixSendRequest {.ffi.} = object
   destPeerId: string ## Multibase-encoded libp2p peer id of the exit destination.
-  destMultiaddr: string
-    ## One routable multiaddr of the destination. Ignored when isExitDest=true.
   proto: string ## The libp2p protocol id the destination will accept the payload on.
   payload: seq[byte]
   expectReply: bool ## If true, includes a single-use SURB for a reply.
   numSurbs: int64 ## Non-zero only when expectReply=true; LIP LOGOS-MIXNET expects 1.
   timeoutMs: int64
-  isExitDest: bool
-    ## If true, address the exit as the destination (uses
-    ## `MixDestination.exitNode(peerId)`, which needs a `--d:libp2p_mix_experimental_exit_is_dest`
-    ## build — the flag is on for this library). The exit's mounted
-    ## protocol handler receives the payload directly. Use for
-    ## intra-mixnet messaging where the receiver is also a mix node.
-    ## If false, uses `MixDestination.forwardToAddr(peerId, multiaddr)`
-    ## to dial an external destination.
 
 type MixPeerRecord {.ffi.} = object
-  exitEnabled: bool
   ## Everything needed to install a peer in another node's `nodePool` so it
   ## can be picked as a Sphinx hop. Fetch via `libp2pMixRlnGetLocalMixPeerRecord`
   ## and hand to `libp2pMixRlnAddMixPeer` on other nodes.
@@ -323,6 +358,7 @@ proc libp2pMixRlnCreate*(
   ok(
     LibMixRln(
       allowSend: cfg.mix.allowSend,
+      allowExit: cfg.mix.allowExit,
       switch: switch,
       mixProto: proto,
       coverTraffic: coverTraffic,
@@ -482,27 +518,13 @@ proc libp2pMixRlnSendMixMessage*(
 ): Future[Result[MixSendResponse, string]] {.ffi.} =
   ## Sends `req.payload` through a Sphinx circuit to the exit destination,
   ## which will unwrap and hand it to `req.proto` on the destination node.
-  ## When `req.isExitDest` is set, addresses the exit as the destination
-  ## (uses `MixDestination.exitNode`); otherwise routes to an external
-  ## destination via `MixDestination.forwardToAddr`.
+  ## Logos supports exit == destination only.
   if not lib.allowSend:
     return err("Application sending disabled; set mix.allowSend=true")
   let destPid = PeerId.init(req.destPeerId).valueOr:
     return err("invalid destPeerId: " & $error)
 
-  let dest =
-    if req.isExitDest:
-      when defined(libp2p_mix_experimental_exit_is_dest):
-        MixDestination.exitNode(destPid)
-      else:
-        return err(
-          "isExitDest set but library built without " &
-            "-d:libp2p_mix_experimental_exit_is_dest"
-        )
-    else:
-      let addr0 = MultiAddress.init(req.destMultiaddr).valueOr:
-        return err("invalid destMultiaddr: " & error)
-      MixDestination.forwardToAddr(destPid, addr0)
+  let dest = MixDestination.exitNode(destPid)
 
   var params = MixParameters()
   if req.expectReply:
@@ -616,7 +638,6 @@ proc libp2pMixRlnGetLocalMixPeerRecord*(
   let libp2pPubKeyBytes = lib.switch.peerInfo.publicKey.skkey.getBytes()
   ok(
     MixPeerRecord(
-      exitEnabled: lib.mixProto.localMixPubInfo.exitEnabled,
       peerId: $lib.switch.peerInfo.peerId,
       multiaddrs: addrs,
       mixPubKey: fieldElementToBytes(lib.mixProto.localMixPubInfo.mixPubKey),
@@ -640,9 +661,7 @@ proc libp2pMixRlnAddMixPeer*(
     return err("invalid libp2pPubKeyHex: " & e.msg)
   let libp2pPub = SkPublicKey.init(libp2pPubBytes).valueOr:
     return err("SkPublicKey.init failed: " & $error)
-  lib.mixProto.nodePool.add(
-    MixPubInfo.init(peerId, ma, mixPub, libp2pPub, rec.exitEnabled)
-  )
+  lib.mixProto.nodePool.add(MixPubInfo.init(peerId, ma, mixPub, libp2pPub))
   ok(true)
 
 type RlnCoordFrame {.ffi.} = object
@@ -670,7 +689,7 @@ proc libp2pMixRlnMountReceiver*(
   ## event with the payload, and closes. Also registers a
   ## `readLp(maxSize)` DestReadBehavior on the mix protocol so exit-is-dest
   ## replies frame correctly.
-  if not lib.mixProto.localMixPubInfo.exitEnabled:
+  if not lib.allowExit:
     return err("Application exit delivery disabled; set mix.allowExit=true")
   let maxSize =
     if req.maxSize > 0:
