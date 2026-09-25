@@ -540,14 +540,6 @@ static int get_cover_rate(LibMixRlnCtx* ctx, double* out) {
     return 0;
 }
 
-static int set_cover_rate(LibMixRlnCtx* ctx, double rate) {
-    SetCoverRateRequest req = { .rate = rate };
-    Waiter w; waiter_init(&w);
-    (void)libp2p_mix_rln_ctx_set_cover_traffic_rate(ctx, &req, on_bool, &w);
-    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
-    return 0;
-}
-
 int main(void) {
     liblibp2p_mix_rlnNimMain();
     fprintf(stderr, "[smoke] NimMain done\n");
@@ -587,17 +579,6 @@ int main(void) {
         fprintf(stderr, "initial cover rate mismatch: %.6f\n", cover_rate);
         return 1;
     }
-    if (set_cover_rate(nodes[0], 0.02)) {
-        fprintf(stderr, "set_cover_rate failed\n");
-        return 1;
-    }
-    if (get_cover_rate(nodes[0], &cover_rate) || cover_rate < 0.0199 || cover_rate > 0.0201) {
-        fprintf(stderr, "updated cover rate mismatch: %.6f\n", cover_rate);
-        return 1;
-    }
-    fprintf(stderr, "[smoke] live cover rate updated to %.2f\n", cover_rate);
-
-
     // Fetch each node's public record so we can cross-register.
     for (int i = 0; i < N; i++)
         if (fetch_record(nodes[i], &recs[i])) {

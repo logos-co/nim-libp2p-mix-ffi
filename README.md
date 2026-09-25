@@ -59,7 +59,7 @@ Real, exercised at runtime:
   `mountReceiver`; intermediate hops require no application receiver.
 - Events: `onIncomingMixMessage`, `onRlnModuleRequest`, and
   `onRlnPublishRequested`.
-- SURB replies, membership-index lookup and live cover-rate updates.
+- SURB replies, membership-index lookup and cover-rate inspection.
 
 The host must subscribe to `onRlnPublishRequested` before starting traffic,
 publish the topic and bytes through its coordination transport,
