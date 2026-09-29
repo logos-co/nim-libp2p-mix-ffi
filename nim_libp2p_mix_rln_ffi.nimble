@@ -22,7 +22,7 @@ requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457
 
 requires "libp2p == 2.3.1"
 requires "https://github.com/richard-ramos/nim-libp2p-mix#d4aeff5f032563fc0f9b042a1c8c049d9fa69fba"
-requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#074e4d775657f3c86ac4dc81eb7c06bf554d81bb"
+requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#ac83f368e286c033e72fbd08dc63a4a802cfac0d"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:
