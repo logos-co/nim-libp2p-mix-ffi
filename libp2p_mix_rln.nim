@@ -162,12 +162,6 @@ type MixSurbReplyRequest {.ffi.} = object
   surb: seq[byte] ## Raw SURB bytes from IncomingMixMessageEvent.surb.
   payload: seq[byte]
 
-type CoverRateResponse {.ffi.} = object
-  rate: float64
-
-type SetCoverRateRequest {.ffi.} = object
-  rate: float64
-
 type MixPeerEntry {.ffi.} = object
   peerId: string
   multiaddrs: seq[string]
@@ -717,18 +711,6 @@ proc libp2pMixRlnMountReceiver*(
     return err("receiver LPProtocol.start failed: " & e.msg)
   lib.switch.mount(p)
   lib.mixProto.registerDestReadBehavior(codec, readLp(maxSize))
-  ok(true)
-
-proc libp2pMixRlnGetCoverTrafficRate*(
-    lib: LibMixRln
-): Future[Result[CoverRateResponse, string]] {.ffi.} =
-  ok(CoverRateResponse(rate: lib.coverTraffic.coverRateFraction()))
-
-proc libp2pMixRlnSetCoverTrafficRate*(
-    lib: LibMixRln, req: SetCoverRateRequest
-): Future[Result[bool, string]] {.ffi.} =
-  (await lib.coverTraffic.setCoverRateFraction(req.rate)).isOkOr:
-    return err(error)
   ok(true)
 
 # ----------------------------------------------------------------------------

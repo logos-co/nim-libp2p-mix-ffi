@@ -36,7 +36,6 @@ typedef struct {
     uint8_t         reply_bytes[4096];
     size_t          reply_bytes_len;
     char            reply_string[512];
-    double          reply_rate;
     int64_t         reply_index;
 } Waiter;
 
@@ -52,7 +51,6 @@ static void waiter_init(Waiter* w) {
     w->reply_bool_valid = 0;
     w->reply_bytes_len = 0;
     w->reply_string[0] = '\0';
-    w->reply_rate = 0.0;
     w->reply_index = -1;
 }
 
@@ -127,14 +125,6 @@ static void on_node_info(int ec, const NodeInfoResponse* r,
     waiter_signal(w);
 }
 
-static void on_cover_rate(int ec, const CoverRateResponse* r,
-                          const char* em, void* ud) {
-    Waiter* w = (Waiter*)ud;
-    w->err_code = ec;
-    if (r) w->reply_rate = r->rate;
-    if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
-    waiter_signal(w);
-}
 // binding and freed after this callback returns.
 static void on_peer_record(int ec, const MixPeerRecord* r,
                            const char* em, void* ud) {
@@ -532,22 +522,6 @@ static int get_membership_index(LibMixRlnCtx* ctx, int64_t* out) {
     return 0;
 }
 
-static int get_cover_rate(LibMixRlnCtx* ctx, double* out) {
-    Waiter w; waiter_init(&w);
-    (void)libp2p_mix_rln_ctx_get_cover_traffic_rate(ctx, on_cover_rate, &w);
-    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
-    *out = w.reply_rate;
-    return 0;
-}
-
-static int set_cover_rate(LibMixRlnCtx* ctx, double rate) {
-    SetCoverRateRequest req = { .rate = rate };
-    Waiter w; waiter_init(&w);
-    (void)libp2p_mix_rln_ctx_set_cover_traffic_rate(ctx, &req, on_bool, &w);
-    if (waiter_wait(&w, 10) != 0 || w.err_code != 0) return -1;
-    return 0;
-}
-
 int main(void) {
     liblibp2p_mix_rlnNimMain();
     fprintf(stderr, "[smoke] NimMain done\n");
@@ -581,22 +555,6 @@ int main(void) {
     for (int i = 0; i < N; i++)
         if (start_node(nodes[i])) { fprintf(stderr, "start[%d] failed\n", i); return 1; }
     fprintf(stderr, "[smoke] all %d nodes started\n", N);
-
-    double cover_rate = 0.0;
-    if (get_cover_rate(nodes[0], &cover_rate) || cover_rate < 0.0099 || cover_rate > 0.0101) {
-        fprintf(stderr, "initial cover rate mismatch: %.6f\n", cover_rate);
-        return 1;
-    }
-    if (set_cover_rate(nodes[0], 0.02)) {
-        fprintf(stderr, "set_cover_rate failed\n");
-        return 1;
-    }
-    if (get_cover_rate(nodes[0], &cover_rate) || cover_rate < 0.0199 || cover_rate > 0.0201) {
-        fprintf(stderr, "updated cover rate mismatch: %.6f\n", cover_rate);
-        return 1;
-    }
-    fprintf(stderr, "[smoke] live cover rate updated to %.2f\n", cover_rate);
-
 
     // Fetch each node's public record so we can cross-register.
     for (int i = 0; i < N; i++)
