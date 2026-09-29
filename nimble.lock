@@ -381,8 +381,8 @@
       }
     },
     "libp2p_mix": {
-      "version": "#3c26b907cdd9de58d748939391bdf464b99be3d9",
-      "vcsRevision": "3c26b907cdd9de58d748939391bdf464b99be3d9",
+      "version": "#d4aeff5f032563fc0f9b042a1c8c049d9fa69fba",
+      "vcsRevision": "d4aeff5f032563fc0f9b042a1c8c049d9fa69fba",
       "url": "https://github.com/richard-ramos/nim-libp2p-mix",
       "downloadMethod": "git",
       "dependencies": [
@@ -397,12 +397,12 @@
         "unittest2"
       ],
       "checksums": {
-        "sha1": "073d64d6459ef861278aaf9982d7e89b60c5a37f"
+        "sha1": "e18ca93dd0ec0d0b149754520b050f3f19483125"
       }
     },
     "mix_rln_spam_protection": {
-      "version": "#4cb0b16f8a9f3d7e8b1e759e2179277fb6bbd519",
-      "vcsRevision": "4cb0b16f8a9f3d7e8b1e759e2179277fb6bbd519",
+      "version": "#074e4d775657f3c86ac4dc81eb7c06bf554d81bb",
+      "vcsRevision": "074e4d775657f3c86ac4dc81eb7c06bf554d81bb",
       "url": "https://github.com/logos-co/mix-rln-spam-protection-plugin",
       "downloadMethod": "git",
       "dependencies": [
@@ -415,10 +415,11 @@
         "secp256k1",
         "json_serialization",
         "libp2p",
-        "libp2p_mix"
+        "libp2p_mix",
+        "metrics"
       ],
       "checksums": {
-        "sha1": "b0ecbc7d6196c7b1886455a70d70cf1e41695991"
+        "sha1": "63d6cd4a27f90d7ae7375b7f13a0b2f8a88823d5"
       }
     }
   },

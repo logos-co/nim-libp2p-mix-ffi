@@ -320,7 +320,6 @@ proc libp2pMixRlnCreate*(
       rlnIdentifierHex: cfg.rln.rlnIdentifierHex,
       epochSeconds: uint64(cfg.rln.epochDurationSeconds),
       maxEpochGap: uint64(cfg.rln.maxEpochGap),
-      messageLimit: cfg.rln.userMessageLimit,
       metadataTopic: cfg.rln.proofMetadataContentTopic,
     ),
     proc(
