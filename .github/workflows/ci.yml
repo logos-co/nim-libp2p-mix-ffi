@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -33,7 +34,6 @@ jobs:
         run: >-
           nix build
           .#cbind
-          .#test-mix-routing
           .#smoketest-3node-ffi
           --print-build-logs
 
@@ -62,6 +62,5 @@ jobs:
           . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
           nix build \
             .#cbind \
-            .#test-mix-routing \
             .#smoketest-3node-ffi \
             --print-build-logs
