@@ -1,21 +1,25 @@
 { pkgs, src, cbind }:
 
-## Builds tests/smoketest_3node_ffi.c against the cbind output (headers + .so
+## Builds tests/smoketest_3node_ffi.c against the cbind output (headers + shared library
 ## + vendored tinycbor sources) and runs it as part of the derivation. Passing
 ## build = passing test.
 
+let
+  libExt = if pkgs.stdenv.hostPlatform.isDarwin then "dylib" else "so";
+  cxxRuntime = if pkgs.stdenv.hostPlatform.isDarwin then "c++" else "stdc++";
+in
 pkgs.stdenv.mkDerivation {
   pname = "nim-libp2p-mix-ffi-smoketest-3node-ffi";
   version = "dev";
 
   inherit src;
 
-  nativeBuildInputs = [ pkgs.gcc ];
+  nativeBuildInputs = [ pkgs.stdenv.cc ];
 
   buildPhase = ''
     set -eu
     export HOME=$TMPDIR
-    gcc -std=c11 -O2 -g \
+    cc -std=c11 -O2 -g \
       -I${cbind}/include -I${cbind}/include/tinycbor \
       tests/smoketest_3node_ffi.c \
       ${cbind}/include/tinycbor/cborencoder.c \
@@ -23,8 +27,8 @@ pkgs.stdenv.mkDerivation {
       ${cbind}/include/tinycbor/cborparser.c \
       ${cbind}/include/tinycbor/cborparser_dup_string.c \
       ${cbind}/include/tinycbor/cborerrorstrings.c \
-      ${cbind}/lib/liblibp2p_mix_rln.so \
-      -lpthread -lstdc++ \
+      ${cbind}/lib/liblibp2p_mix_rln.${libExt} \
+      -lpthread -l${cxxRuntime} \
       -Wl,-rpath,${cbind}/lib \
       -o smoketest_3node_ffi
   '';

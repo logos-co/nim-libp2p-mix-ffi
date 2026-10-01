@@ -11,6 +11,8 @@ let
   # Re-import the same dep set cbind.nix builds against; keeps them in sync.
   cbindDeps = import ./cbind-deps.nix { inherit pkgs; };
 
+  cxxRuntime = if pkgs.stdenv.hostPlatform.isDarwin then "c++" else "stdc++";
+
   pathArgs =
     builtins.concatStringsSep " "
       (map (p: "--path:${p} --path:${p}/src")
@@ -37,6 +39,7 @@ pkgs.stdenv.mkDerivation {
       --threads:on --mm:refc -d:release \
       -d:chronicles_runtime_filtering=on -d:chronicles_log_level=INFO \
       -d:libp2p_mix_experimental_exit_is_dest \
+      --passL:-l${cxxRuntime} \
       --nimcache:$NIMCACHE -o:test_mix_routing \
       tests/test_mix_routing.nim
 
