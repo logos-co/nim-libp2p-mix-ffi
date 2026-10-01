@@ -1,5 +1,5 @@
 // Five-node C ABI test with a mock shared RLN backend.
-// Exercises callback transport, Sphinx routing, coordination, endpoint policy,
+// Exercises callback transport, Sphinx routing, coordination,
 // and SURB replies. The mock does not verify cryptography; the Logos module's
 // shared_delivery_mix fixture covers real proofs and registry memberships.
 
@@ -244,7 +244,7 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
     char method[64], body[1200];
     snprintf(method, sizeof(method), "%.*s", (int)evt->methodName.len, evt->methodName.data);
     if (strcmp(method, "get_registry_parameters") == 0) {
-        snprintf(body, sizeof(body), "{\"epoch_size_sec\":10}");
+        snprintf(body, sizeof(body), "{\"epoch_size_sec\":10,\"max_epoch_gap\":3}");
     } else if (strcmp(method, "register_membership") == 0 ||
                strcmp(method, "get_membership_state") == 0) {
         snprintf(body, sizeof(body), "{\"state\":\"active\",\"leaf_index\":%d}", backend->index);
@@ -391,7 +391,10 @@ static int add_peer(LibMixRlnCtx* ctx, const MixPeerRecord* rec, const char* lab
 static int start_node(LibMixRlnCtx* ctx) {
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_start(ctx, on_bool, &w);
-    if (waiter_wait(&w, 30) != 0 || w.err_code != 0) return -1;
+    if (waiter_wait(&w, 30) != 0 || w.err_code != 0) {
+        fprintf(stderr, "start failed: %s\n", w.err_msg);
+        return -1;
+    }
     return 0;
 }
 
@@ -638,6 +641,19 @@ int main(void) {
     sr.expectReply   = true;
     sr.numSurbs      = 1;
     sr.timeoutMs     = 15000;
+
+    // A failed write must close its reply connection; the next send must work.
+    uint8_t oversized[8192] = {0};
+    MixSendRequest rejected = sr;
+    rejected.payload.data = oversized;
+    rejected.payload.len = sizeof(oversized);
+    Waiter failed; waiter_init(&failed);
+    (void)libp2p_mix_rln_ctx_send_mix_message(A, &rejected, on_mix_send, &failed);
+    if (waiter_wait(&failed, 10) || !failed.err_code ||
+        !strstr(failed.err_msg, "writeLp failed: exceeds max msg size")) {
+        fprintf(stderr, "oversized send was not rejected: %s\n", failed.err_msg);
+        return 1;
+    }
 
     Waiter sw; waiter_init(&sw);
     fprintf(stderr, "[smoke] sending mix message from A to C\n");
