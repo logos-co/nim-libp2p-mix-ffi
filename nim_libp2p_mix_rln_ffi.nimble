@@ -85,14 +85,3 @@ task genbindings_c, "Generate C bindings (c_bindings/libp2p_mix_rln.h)":
 
 task genbindings_cddl, "Generate CDDL schema":
   genBindingsFor("cddl", "cddl_bindings")
-
-task test, "Run integration tests":
-  for f in listFiles("tests"):
-    let (_, name, ext) = f.splitFile
-    if ext != ".nim" or not name.startsWith("test_"):
-      continue
-    exec "nim c -r --threads:on --mm:refc" &
-      " -d:libp2p_mix_experimental_exit_is_dest" &
-      ffiDepPaths() &
-      " --nimcache:nimcache_" & name & " tests/" & name & ".nim"
-    rmFile "tests/" & name.toExe
