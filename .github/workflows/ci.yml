@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+          - name: macOS arm64
+            runner: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: Build library and run tests
+        run: >-
+          nix build
+          .#cbind
+          .#test-mix-routing
+          .#smoketest-3node-ffi
+          --print-build-logs
+
+  wsl:
+    name: Build and test (WSL x86_64)
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up WSL
+        uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          wsl-shell-user: root
+          additional-packages: curl ca-certificates xz-utils git
+
+      - name: Install Nix, build library, and run tests
+        shell: wsl-bash {0}
+        run: |
+          test "$(uname -m)" = x86_64
+          curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix |
+            sh -s -- install linux --init none --no-confirm
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix build \
+            .#cbind \
+            .#test-mix-routing \
