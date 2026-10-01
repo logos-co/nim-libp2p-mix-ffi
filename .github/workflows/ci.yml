@@ -63,3 +63,5 @@ jobs:
           nix build \
             .#cbind \
             .#test-mix-routing \
+            .#smoketest-3node-ffi \
+            --print-build-logs
