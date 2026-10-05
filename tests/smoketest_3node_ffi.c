@@ -391,8 +391,10 @@ static int add_peer(LibMixRlnCtx* ctx, const MixPeerRecord* rec, const char* lab
 static int start_node(LibMixRlnCtx* ctx) {
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_start(ctx, on_bool, &w);
-    if (waiter_wait(&w, 30) != 0 || w.err_code != 0) {
-        fprintf(stderr, "start failed: %s\n", w.err_msg);
+    int wait_rc = waiter_wait(&w, 30);
+    if (wait_rc != 0 || w.err_code != 0) {
+        fprintf(stderr, "start_node: wait=%d err_code=%d msg='%s'\n",
+                wait_rc, w.err_code, w.err_msg);
         return -1;
     }
     return 0;
