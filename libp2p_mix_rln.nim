@@ -94,7 +94,6 @@ type LibMixRln* = ref object
   ## / `libp2pMixRlnDestroy`.
   switch: Switch
   mixProto: MixProtocol
-  coverTraffic: ConstantRateCoverTraffic
   moduleRln: ModuleRlnProtection
   rlnRequests: RlnRequests
   registrationOptions: string
@@ -349,7 +348,6 @@ proc libp2pMixRlnCreate*(
     LibMixRln(
       switch: switch,
       mixProto: proto,
-      coverTraffic: coverTraffic,
       moduleRln: moduleRln,
       rlnRequests: requests,
       registrationOptions: cfg.rln.registrationOptionsJson,
@@ -530,13 +528,15 @@ proc libp2pMixRlnSendMixMessage*(
   let conn = lib.mixProto.toConnection(dest, req.proto, params).valueOr:
     return err("toConnection failed: " & error)
 
+  defer:
+    try:
+      await conn.close()
+    except CatchableError as e:
+      warn "conn.close failed after send", err = e.msg
+
   try:
     await conn.writeLp(req.payload)
   except LPStreamError as e:
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
     return err("writeLp failed: " & e.msg)
 
   var reply: seq[byte]
@@ -544,16 +544,7 @@ proc libp2pMixRlnSendMixMessage*(
     try:
       reply = await conn.readLp(MessageSize)
     except LPStreamError as e:
-      try:
-        await conn.close()
-      except CatchableError:
-        discard
       return err("reply read failed: " & e.msg)
-
-  try:
-    await conn.close()
-  except CatchableError as e:
-    warn "conn.close failed after send", err = e.msg
 
   ok(MixSendResponse(ok: true, reply: reply))
 
@@ -649,9 +640,7 @@ proc libp2pMixRlnAddMixPeer*(
   ok(true)
 
 type RlnCoordFrame {.ffi.} = object
-  ## A coordination frame delivered to the plugin. `contentTopic` selects
-  ## which handler runs (`handleMembershipUpdate` or `handleProofMetadata`);
-  ## the plugin decodes `data` per topic.
+  ## Proof metadata received on the configured coordination topic.
   contentTopic: string
   data: seq[byte]
 

@@ -20,7 +20,7 @@ capability.
 ## Status
 
 The C smoke test runs five nodes over TCP and QUIC using a mock shared RLN
-backend. It covers asynchronous callback transport, endpoint restrictions,
+backend. It covers asynchronous callback transport,
 Sphinx routing, metadata coordination, and SURB replies. The mock does not
 perform cryptography.
 
@@ -42,7 +42,6 @@ provide `liblogos_rln_module` and service the asynchronous proof requests.
 ## Tests
 
 ```sh
-nix build .#test-mix-routing         # 5-node Sphinx circuit (no RLN)
 nix build .#smoketest-3node-ffi      # C routing test with a mock shared backend
 ```
 
@@ -107,11 +106,10 @@ nim-libp2p-mix-ffi/
 ├── nix/
 │   ├── cbind.nix                  # hermetic build derivation
 │   ├── cbind-deps.nix             # pinned deps from nimble.lock
-│   ├── smoketest-3node-ffi.nix    # C smoke test derivation
-│   └── test-mix-routing.nix       # 5-node Sphinx test (no RLN)
+│   └── smoketest-3node-ffi.nix    # C smoke test derivation
 ├── tools/regen-cbind-deps.py      # regenerate cbind-deps.nix after bumping pins
 ├── flake.nix                      # outputs packages.<system>.{cbind,tests}
-├── tests/                         # Nim + C integration tests
+├── tests/                         # C integration test
 ├── Makefile
 ├── UPSTREAM_ISSUES.md             # blockers/gaps found upstream during integration
 ├── config.nims

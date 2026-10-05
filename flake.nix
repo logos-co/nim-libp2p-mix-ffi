@@ -35,12 +35,6 @@
             cbind = cbindPkg;
           };
 
-          # `test-mix-routing`: builds AND runs tests/test_mix_routing.nim as
-          # part of the derivation. A passing build = a passing test.
-          test-mix-routing = import ./nix/test-mix-routing.nix {
-            inherit pkgs;
-            src = ./.;
-          };
 
         }
       );
