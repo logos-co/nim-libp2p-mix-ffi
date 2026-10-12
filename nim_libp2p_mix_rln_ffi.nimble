@@ -21,8 +21,8 @@ requires "taskpools >= 0.1.0"
 requires "https://github.com/logos-messaging/nim-ffi#07ee8e1d6500762bab290465457a8d23559de546"
 
 requires "libp2p == 2.3.1"
-requires "https://github.com/richard-ramos/nim-libp2p-mix#d4aeff5f032563fc0f9b042a1c8c049d9fa69fba"
-requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#ac83f368e286c033e72fbd08dc63a4a802cfac0d"
+requires "https://github.com/logos-co/nim-libp2p-mix#489dd38dc83a4678878f5feaba59c7cffd1c6af1"
+requires "https://github.com/logos-co/mix-rln-spam-protection-plugin#7b5c7cfafbffe4e47aeb46838633645afacdb73c"
 
 # Build tasks --------------------------------------------------------------
 # Modelled on vacp2p/nim-libp2p `cbind/cbind.nimble`. Two products:
