@@ -158,7 +158,7 @@ type MixSendResponse {.ffi.} = object
   reply: seq[byte] ## Empty unless expectReply=true and a reply was received.
 
 type MixSurbReplyRequest {.ffi.} = object
-  surb: seq[byte] ## Raw SURB bytes from IncomingMixMessageEvent.surb.
+  surbs: seq[byte] ## Count-prefixed bundle from IncomingMixMessageEvent.surbs.
   payload: seq[byte]
 
 type MixPeerEntry {.ffi.} = object
@@ -178,7 +178,7 @@ type RlnMembershipStatus {.ffi.} = object
 type IncomingMixMessageEvent {.ffi.} = object
   proto: string
   payload: seq[byte]
-  surb: seq[byte] ## Raw SURB bytes; empty when the sender did not include one.
+  surbs: seq[byte] ## Count-prefixed bundle; empty when no SURBs were included.
 
 type RlnModuleRequestEvent {.ffi.} = object
   requestId: int64
@@ -199,7 +199,7 @@ proc onRlnModuleRequest*(event: RlnModuleRequestEvent) {.ffiEvent.} =
 
 proc onIncomingMixMessage*(event: IncomingMixMessageEvent) {.ffiEvent.} =
   ## Fired when a mounted mix-destination protocol receives a message. Pass a
-  ## non-empty `event.surb` to `libp2pMixRlnSendMixSurbReply` to reply.
+  ## non-empty `event.surbs` to `libp2pMixRlnSendMixSurbReply` to reply.
 
 proc onRlnPublishRequested*(event: RlnPublishRequestedEvent) {.ffiEvent.} =
   ## Forward asynchronously; do not call back into this context from the event.
@@ -548,24 +548,22 @@ proc libp2pMixRlnSendMixMessage*(
 
   ok(MixSendResponse(ok: true, reply: reply))
 
-proc serializeSurb(surb: SURB): seq[byte] =
-  surb.hop.serialize() & surb.header.serialize() & surb.key
-
 proc libp2pMixRlnSendMixSurbReply*(
     lib: LibMixRln, req: MixSurbReplyRequest
 ): Future[Result[bool, string]] {.ffi.} =
-  let decoded = extractSURBs(@[1.byte] & req.surb).valueOr:
+  let decoded = extractSURBs(req.surbs).valueOr:
     return err("invalid SURB: " & error)
   let (surbs, trailing) = decoded
-  if surbs.len != 1 or trailing.len != 0:
-    return err("SURB must contain exactly one reply block")
+  if surbs.len == 0 or trailing.len != 0:
+    return err("SURBs must contain reply blocks without trailing data")
 
   let prefix = PB.toBytes(req.payload.len.uint64)
   var framed = newSeq[byte](prefix.len + req.payload.len)
   framed[0 ..< prefix.len] = prefix.toOpenArray()
   framed[prefix.len ..< framed.len] = req.payload
-  (await lib.mixProto.sendSurbReply(surbs[0], move(framed))).isOkOr:
-    return err(error)
+  for surb in surbs:
+    (await lib.mixProto.sendSurbReply(surb, framed)).isOkOr:
+      return err(error)
   ok(true)
 
 # ----------------------------------------------------------------------------
@@ -674,13 +672,15 @@ proc libp2pMixRlnMountReceiver*(
   ) {.async: (raises: [CancelledError]).} =
     try:
       let bytes = await conn.readLp(maxSize)
-      var surb: seq[byte]
+      var bundle: seq[byte]
       if conn of MixExitConnection:
         let surbs = MixExitConnection(conn).takeSURBs()
         if surbs.len > 0:
-          surb = serializeSurb(surbs[0])
+          bundle = serializeMessageWithSURBs(@[], surbs).valueOr:
+            warn "MountReceiver: SURB serialization failed", err = error
+            return
       onIncomingMixMessage(
-        IncomingMixMessageEvent(proto: proto, payload: bytes, surb: surb)
+        IncomingMixMessageEvent(proto: proto, payload: bytes, surbs: bundle)
       )
     except LPStreamError as e:
       warn "MountReceiver: readLp failed", codec = proto, err = e.msg

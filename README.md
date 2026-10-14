@@ -130,3 +130,14 @@ make genbindings
 [mix-rln]: https://github.com/logos-co/mix-rln-spam-protection-plugin
 [logos-mod]: https://github.com/logos-co/logos-libp2p-mix-rln
 [nim-ffi]: https://github.com/logos-messaging/nim-ffi
+
+### Reply bundles
+
+`IncomingMixMessageEvent.surbs` preserves all reply blocks as an opaque,
+count-prefixed Mix SURB bundle (empty when the request has none). Pass it
+unchanged in `MixSurbReplyRequest.surbs`. The reply operation validates the
+whole bundle, then sends the same payload through each block. It stops on
+the first send error; earlier blocks may already have been consumed.
+This replaces the single-block `surb` fields and requires consumers to rebuild.
+The legacy sender still returns only the first reply; asynchronous sender
+tracking and timeout policy are separate work.

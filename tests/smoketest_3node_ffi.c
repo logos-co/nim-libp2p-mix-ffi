@@ -187,7 +187,7 @@ static void on_surb_reply(int ec, const bool* reply, const char* em, void* ud) {
 static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     InboxSlot* s = (InboxSlot*)ud;
     fprintf(stderr, "[smoke] incoming request reached destination; surb_len=%zu\n",
-            evt->surb.len);
+            evt->surbs.len);
     pthread_mutex_lock(&s->m);
     size_t plen = evt->payload.len < sizeof(s->payload) - 1
                   ? evt->payload.len : sizeof(s->payload) - 1;
@@ -200,14 +200,14 @@ static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     atomic_store(&s->fired, 1);
     pthread_cond_signal(&s->c);
     pthread_mutex_unlock(&s->m);
-    if (evt->surb.len == 0) {
-        snprintf(s->reply_err, sizeof(s->reply_err), "incoming event had no SURB");
+    if (evt->surbs.len == 0 || evt->surbs.data[0] != 2) {
+        snprintf(s->reply_err, sizeof(s->reply_err), "incoming event did not preserve both SURBs");
         atomic_store(&s->reply_completed, 1);
         return;
     }
     MixSurbReplyRequest req;
     memset(&req, 0, sizeof(req));
-    req.surb = evt->surb;
+    req.surbs = evt->surbs;
     req.payload.data = (uint8_t*)kReplyPayload;
     req.payload.len = strlen(kReplyPayload);
     (void)libp2p_mix_rln_ctx_send_mix_surb_reply(s->ctx, &req, on_surb_reply, s);
@@ -633,6 +633,21 @@ int main(void) {
         C, on_incoming, &inbox);
     fprintf(stderr, "[smoke] mounted receiver + event listener on C\n");
 
+    // Invalid bundles must be rejected before any reply is sent.
+    uint8_t invalid_bundles[][2] = {{0, 0}, {0, 0}, {1, 0}, {0, 42}};
+    size_t invalid_lengths[] = {0, 1, 1, 2};
+    for (size_t i = 0; i < 4; ++i) {
+        MixSurbReplyRequest bad = {0};
+        bad.surbs.data = invalid_bundles[i];
+        bad.surbs.len = invalid_lengths[i];
+        Waiter invalid; waiter_init(&invalid);
+        (void)libp2p_mix_rln_ctx_send_mix_surb_reply(C, &bad, on_bool, &invalid);
+        if (waiter_wait(&invalid, 10) || !invalid.err_code) {
+            fprintf(stderr, "invalid SURB bundle was not rejected\n");
+            return 1;
+        }
+    }
+
     // A sends to C via mix path.
     MixSendRequest sr;
     memset(&sr, 0, sizeof(sr));
@@ -641,7 +656,7 @@ int main(void) {
     sr.payload.data  = (uint8_t*)kTestPayload;
     sr.payload.len   = strlen(kTestPayload);
     sr.expectReply   = true;
-    sr.numSurbs      = 1;
+    sr.numSurbs      = 2;
     sr.timeoutMs     = 15000;
 
     // A failed write must close its reply connection; the next send must work.
@@ -662,6 +677,11 @@ int main(void) {
     (void)libp2p_mix_rln_ctx_send_mix_message(A, &sr, on_mix_send, &sw);
     if (waiter_wait(&sw, 30) != 0 || sw.err_code != 0) {
         fprintf(stderr, "send_mix_message failed: %s\n", sw.err_msg); return 1;
+    }
+    // The legacy sender returns after the first reply; wait for both sends.
+    for (int i = 0; i < 1500 && !atomic_load(&inbox.reply_completed); ++i) {
+        struct timespec delay = {0, 10000000};
+        nanosleep(&delay, NULL);
     }
     if (!atomic_load(&inbox.reply_completed) || !atomic_load(&inbox.reply_ok)) {
         fprintf(stderr, "SURB reply send failed: %s\n", inbox.reply_err);
