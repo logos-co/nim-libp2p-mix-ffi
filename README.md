@@ -49,7 +49,7 @@ nix build .#smoketest-3node-ffi      # C routing test with a mock shared backend
 
 Real, exercised at runtime:
 - Full lifecycle (`create` / `start` / `stop` / `destroy`).
-- `sendMixMessage` — Sphinx-routed writeLp, optional SURB reply.
+- `sendMixMessage` — asynchronous Sphinx-routed send with an explicit SURB count; returns a message ID.
 - `sendMixMessage` always uses exit-is-destination routing; no destination
   multiaddr or mode flag is exposed.
 - `registerRlnMembership` / `hasRlnMembership`.
@@ -130,3 +130,25 @@ make genbindings
 [mix-rln]: https://github.com/logos-co/mix-rln-spam-protection-plugin
 [logos-mod]: https://github.com/logos-co/logos-libp2p-mix-rln
 [nim-ffi]: https://github.com/logos-messaging/nim-ffi
+
+### Reply bundles
+
+`IncomingMixMessageEvent.surbs` preserves all reply blocks as an opaque,
+count-prefixed Mix SURB bundle (empty when the request has none). Pass it
+unchanged in `MixSurbReplyRequest.surbs`. The reply operation validates the
+whole bundle, then sends the same payload through each block. It stops on
+the first send error; earlier blocks may already have been consumed.
+This replaces the single-block `surb` fields and requires consumers to rebuild.
+`MixSendResponse.messageId` acknowledges transmission. `onMixReplyReceived`
+emits that ID and the decoded payload for each reply; senders do not mount a
+receiver. Events can arrive before the send callback, so hosts must correlate
+by ID rather than callback order. The explicit `numSurbs` is range-checked
+before conversion; zero disables replies. Reply-enabled sends require a
+positive `timeoutMs`. This retains the previous per-reply read timeout, bounded
+by the native SURB credential lifetime; it does not define a total-send deadline
+or emit a timeout event. Readers and credentials are released on completion,
+read timeout, or shutdown.
+
+`refreshMembership` requests the backend's complete scoped membership state.
+`onRlnMembership` carries that JSON or an error. Overlapping refreshes coalesce;
+responses from a stopped generation are discarded.
