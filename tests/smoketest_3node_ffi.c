@@ -242,6 +242,8 @@ typedef struct {
     LibMixRlnCtx* ctx;
     int index;
     atomic_int membership_mode;
+    atomic_int stopping;
+    Waiter* held_membership;
 } MockBackend;
 
 static atomic_int backend_errors;
@@ -257,7 +259,11 @@ static void field_hex(char out[65], uint64_t value) {
 }
 
 static void on_backend_response(int ec, const bool* reply, const char* em, void* ud) {
-    (void)ud;
+    MockBackend* backend = ud;
+    // Shutdown cancels pending requests before queued backend responses arrive.
+    if (ec && atomic_load(&backend->stopping) && em &&
+        (strcmp(em, "RLN request already completed") == 0 ||
+         strcmp(em, "Unknown or expired RLN request") == 0)) return;
     if (ec || !reply || !*reply) {
         fprintf(stderr, "backend response failed: %s\n", em ? em : "false reply");
         atomic_fetch_add(&backend_errors, 1);
@@ -268,6 +274,11 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
     MockBackend* backend = ud;
     char method[64], body[1200];
     snprintf(method, sizeof(method), "%.*s", (int)evt->methodName.len, evt->methodName.data);
+    if (strcmp(method, "get_membership_state") == 0 && backend->held_membership) {
+        backend->held_membership->reply_index = evt->requestId;
+        waiter_signal(backend->held_membership);
+        return;
+    }
     if (strcmp(method, "get_registry_parameters") == 0) {
         snprintf(body, sizeof(body), "{\"epoch_size_sec\":10,\"max_epoch_gap\":3}");
     } else if (strcmp(method, "register_membership") == 0 ||
@@ -304,7 +315,7 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
         abort();
     }
     RlnModuleResponse response = {.requestId = evt->requestId, .responseJson = nimffi_str(body)};
-    if (libp2p_mix_rln_ctx_rln_response(backend->ctx, &response, on_backend_response, NULL))
+    if (libp2p_mix_rln_ctx_rln_response(backend->ctx, &response, on_backend_response, backend))
         atomic_fetch_add(&backend_errors, 1);
 }
 
@@ -805,9 +816,36 @@ int main(void) {
     (void)libp2p_mix_rln_ctx_send_mix_message(A, &pending, on_mix_send, &outstanding);
     if (waiter_wait(&outstanding, 10) || outstanding.err_code) return 1;
 
-    // Cleanup.
-    for (int i = 0; i < N; i++)
+    // Hold a real backend request across stop to exercise cancellation deterministically.
+    Waiter held; waiter_init(&held);
+    Waiter refresh; waiter_init(&refresh);
+    backends[0].held_membership = &held;
+    (void)libp2p_mix_rln_ctx_refresh_membership(A, on_bool, &refresh);
+    if (waiter_wait(&held, 10)) return 1;
+    atomic_store(&backends[0].stopping, 1);
+    if (stop_node(A) || waiter_wait(&refresh, 10)) {
+        fprintf(stderr, "held membership refresh did not finish during stop\n");
+        return 1;
+    }
+    RlnModuleResponse response = {
+        .requestId = held.reply_index,
+        .responseJson = nimffi_str("{\"state\":\"active\"}")
+    };
+    Waiter cancelled; waiter_init(&cancelled);
+    (void)libp2p_mix_rln_ctx_rln_response(A, &response, on_bool, &cancelled);
+    if (waiter_wait(&cancelled, 10) || !cancelled.err_code ||
+        strcmp(cancelled.err_msg, "Unknown or expired RLN request")) {
+        fprintf(stderr, "late response was not rejected: %s\n", cancelled.err_msg);
+        return 1;
+    }
+    on_backend_response(cancelled.err_code, &cancelled.reply_bool,
+                        cancelled.err_msg, &backends[0]);
+    fprintf(stderr, "[smoke] PASS: shutdown rejects late backend responses\n");
+
+    for (int i = 1; i < N; i++) {
+        atomic_store(&backends[i].stopping, 1);
         if (stop_node(nodes[i])) return 1;
+    }
     for (int i = 0; i < N; i++) libp2p_mix_rln_ctx_destroy(nodes[i]);
     for (int i = 0; i < N; i++) free_record(&recs[i]);
     if (atomic_load(&backend_errors) || !atomic_load(&proof_serial) ||
