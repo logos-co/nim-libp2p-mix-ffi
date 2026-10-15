@@ -308,7 +308,7 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
         atomic_fetch_add(&backend_errors, 1);
 }
 
-static void on_membership(const RlnMembershipEvent* evt, void* ud) {
+static void on_membership_event(const RlnMembershipEvent* evt, void* ud) {
     Waiter* w = ud;
     w->err_code = evt->error.len ? 1 : 0;
     NimFfiStr value = evt->error.len ? evt->error : evt->stateJson;
@@ -442,7 +442,7 @@ static int start_node(LibMixRlnCtx* ctx) {
 static int stop_node(LibMixRlnCtx* ctx) {
     Waiter w; waiter_init(&w);
     (void)libp2p_mix_rln_ctx_stop(ctx, on_bool, &w);
-    if (waiter_wait(&w, 30) != 0) return -1;
+    if (waiter_wait(&w, 10) != 0 || w.err_code || !w.reply_bool) return -1;
     return 0;
 }
 
@@ -649,7 +649,7 @@ int main(void) {
     fprintf(stderr, "[smoke] all memberships registered through the mock shared backend\n");
 
     Waiter observed; waiter_init(&observed);
-    (void)libp2p_mix_rln_ctx_add_on_rln_membership_listener(A, on_membership, &observed);
+    (void)libp2p_mix_rln_ctx_add_on_rln_membership_listener(A, on_membership_event, &observed);
     const char* expected_states[] = {"active", "pending", "expired", "unavailable"};
     for (int mode = 0; mode < 4; mode++) {
         atomic_store(&backends[0].membership_mode, mode);
@@ -806,7 +806,8 @@ int main(void) {
     if (waiter_wait(&outstanding, 10) || outstanding.err_code) return 1;
 
     // Cleanup.
-    for (int i = 0; i < N; i++) (void)stop_node(nodes[i]);
+    for (int i = 0; i < N; i++)
+        if (stop_node(nodes[i])) return 1;
     for (int i = 0; i < N; i++) libp2p_mix_rln_ctx_destroy(nodes[i]);
     for (int i = 0; i < N; i++) free_record(&recs[i]);
     if (atomic_load(&backend_errors) || !atomic_load(&proof_serial) ||
