@@ -31,7 +31,7 @@ import libp2p_mix
 import
   libp2p_mix/[
     mix_protocol, mix_node, curve25519, pool, cover_traffic, exit_connection,
-    serialization, delay_strategy, spam_protection,
+    serialization, delay_strategy, spam_protection, surb_store,
   ]
 
 # Receiver-side helpers: mounting a plain LPProtocol on the exit switch so
@@ -100,6 +100,10 @@ type LibMixRln* = ref object
   transport: string
   running: bool
   stopped: bool
+  rng: Rng
+  generation: uint64
+  pendingReplies: Table[string, Future[void]]
+  membershipRefreshing: bool
 
 declareLibrary("libp2p_mix_rln", LibMixRln)
 
@@ -131,9 +135,8 @@ type MixSendRequest {.ffi.} = object
   destPeerId: string ## Multibase-encoded libp2p peer id of the exit destination.
   proto: string ## The libp2p protocol id the destination will accept the payload on.
   payload: seq[byte]
-  expectReply: bool ## If true, includes a single-use SURB for a reply.
-  numSurbs: int64 ## Non-zero only when expectReply=true; LIP LOGOS-MIXNET expects 1.
-  timeoutMs: int64
+  numSurbs: int64 ## Explicit count; zero disables replies.
+  timeoutMs: int64 ## Required and positive when numSurbs > 0; per-reply read timeout.
 
 type MixPeerRecord {.ffi.} = object
   ## Everything needed to install a peer in another node's `nodePool` so it
@@ -153,9 +156,7 @@ type MountReceiverRequest {.ffi.} = object
   maxSize: int64
 
 type MixSendResponse {.ffi.} = object
-  ok: bool
-
-  reply: seq[byte] ## Empty unless expectReply=true and a reply was received.
+  messageId: string
 
 type MixSurbReplyRequest {.ffi.} = object
   surbs: seq[byte] ## Count-prefixed bundle from IncomingMixMessageEvent.surbs.
@@ -179,6 +180,20 @@ type IncomingMixMessageEvent {.ffi.} = object
   proto: string
   payload: seq[byte]
   surbs: seq[byte] ## Count-prefixed bundle; empty when no SURBs were included.
+
+type MixReplyReceivedEvent {.ffi.} = object
+  messageId: string
+  payload: seq[byte]
+
+type RlnMembershipEvent {.ffi.} = object
+  stateJson: string
+  error: string
+
+proc onMixReplyReceived*(event: MixReplyReceivedEvent) {.ffiEvent.} =
+  ## One event per received reply block; events may precede the send callback.
+
+proc onRlnMembership*(event: RlnMembershipEvent) {.ffiEvent.} =
+  ## Last backend observation, or an error when it could not be refreshed.
 
 type RlnModuleRequestEvent {.ffi.} = object
   requestId: int64
@@ -352,10 +367,17 @@ proc libp2pMixRlnCreate*(
       rlnRequests: requests,
       registrationOptions: cfg.rln.registrationOptionsJson,
       transport: transport,
+      rng: rng,
     )
   )
 
 proc stopRln(lib: LibMixRln) {.async.} =
+  inc lib.generation
+  var tasks: seq[Future[void]]
+  for task in lib.pendingReplies.values():
+    tasks.add(task)
+  for task in tasks:
+    await task.cancelAndWait()
   lib.rlnRequests.cancel()
   await lib.moduleRln.stop()
 
@@ -365,6 +387,24 @@ proc libp2pMixRlnRlnResponse*(
   lib.rlnRequests.respond(response.requestId, response.responseJson).isOkOr:
     return err(error)
   return ok(true)
+
+proc libp2pMixRlnRefreshMembership*(
+    lib: LibMixRln
+): Future[Result[bool, string]] {.ffi.} =
+  if lib.membershipRefreshing:
+    return ok(false)
+  lib.membershipRefreshing = true
+  let generation = lib.generation
+  try:
+    let state = await lib.moduleRln.scopedCall("get_membership_state")
+    if generation == lib.generation:
+      if state.isOk:
+        onRlnMembership(RlnMembershipEvent(stateJson: $state.get()))
+      else:
+        onRlnMembership(RlnMembershipEvent(error: state.error))
+    return ok(true)
+  finally:
+    lib.membershipRefreshing = false
 
 proc libp2pMixRlnDestroy*(lib: LibMixRln): Future[void] {.ffiDtor.} =
   ## Stops the Mix switch (idempotent) and drops references. The FFI runtime
@@ -476,6 +516,7 @@ proc libp2pMixRlnRegisterRlnMembership*(
   let options = if lib.registrationOptions.len == 0: "[]" else: lib.registrationOptions
   let state = (await lib.moduleRln.scopedCall("register_membership", %*[options])).valueOr:
     return err(error)
+  onRlnMembership(RlnMembershipEvent(stateJson: $state))
   return ok(
     RlnMembershipStatus(
       registered: state.getOrDefault("state").getStr() in ["active", "grace_period"],
@@ -499,54 +540,77 @@ proc libp2pMixRlnHasRlnMembership*(
 # Mixnet send
 # ----------------------------------------------------------------------------
 
+proc framePayload(payload: seq[byte]): seq[byte] =
+  let prefix = PB.toBytes(payload.len.uint64)
+  result = newSeq[byte](prefix.len + payload.len)
+  result[0 ..< prefix.len] = prefix.toOpenArray()
+  result[prefix.len ..< result.len] = payload
+
+proc readReplies(
+    incoming: AsyncQueue[seq[byte]], session: SurbSession,
+    messageId: string, count: int64, timeout: Duration
+) {.async: (raises: []).} =
+  defer:
+    session.release()
+  try:
+    for i in 0 ..< count:
+      let expiresAt = session.igroup.expiresAt
+      let now = Moment.now()
+      if now >= expiresAt:
+        return
+      # A caller's timeout cannot extend the native reply credential lifetime.
+      let frame = await incoming.get().wait(min(timeout, expiresAt - now))
+      var prefixLen: int
+      var payloadLen: uint64
+      if PB.getUVarint(frame, prefixLen, payloadLen).isErr or
+          payloadLen != uint64(frame.len - prefixLen):
+        warn "Malformed Mix reply frame", messageId
+        continue
+      onMixReplyReceived(MixReplyReceivedEvent(
+        messageId: messageId, payload: frame[prefixLen ..< frame.len]
+      ))
+  except CancelledError, AsyncTimeoutError:
+    discard
+  except CatchableError as exc:
+    warn "Mix reply read failed", messageId, err = exc.msg
+
 proc libp2pMixRlnSendMixMessage*(
     lib: LibMixRln, req: MixSendRequest
 ): Future[Result[MixSendResponse, string]] {.ffi.} =
-  ## Sends `req.payload` through a Sphinx circuit to the exit destination,
-  ## which will unwrap and hand it to `req.proto` on the destination node.
-  ## Logos supports exit == destination only.
+  ## Returns after transmission; reply credentials live until reads finish or stop.
+  if not lib.running:
+    return err("node is not running")
+  if req.numSurbs < 0 or req.numSurbs > (MessageSize - SurbLenSize - 1) div SurbSize:
+    return err("numSurbs exceeds the supported SURB count")
+  if req.numSurbs > 0 and
+      (req.timeoutMs <= 0 or req.timeoutMs > high(int64) div 1_000_000):
+    return err("timeoutMs must be a positive representable duration")
   let destPid = PeerId.init(req.destPeerId).valueOr:
     return err("invalid destPeerId: " & $error)
-
-  let dest = MixDestination.exitNode(destPid)
-
-  var params = MixParameters()
-  if req.expectReply:
-    params.expectReply = Opt.some(true)
-    let n =
-      if req.numSurbs > 0:
-        byte(req.numSurbs)
-      else:
-        byte(1)
-    params.numSurbs = Opt.some(n)
-    if req.timeoutMs > 0:
-      params.replyTimeout = Opt.some(req.timeoutMs.milliseconds)
-
-  if req.expectReply and not lib.mixProto.hasDestReadBehavior(req.proto):
-    lib.mixProto.registerDestReadBehavior(req.proto, readLp(MessageSize))
-
-  let conn = lib.mixProto.toConnection(dest, req.proto, params).valueOr:
-    return err("toConnection failed: " & error)
-
-  defer:
-    try:
-      await conn.close()
-    except CatchableError as e:
-      warn "conn.close failed after send", err = e.msg
-
+  var id: array[16, byte]
+  lib.rng.generate(id)
+  let messageId = byteutils.toHex(id)
+  let generation = lib.generation
+  let incoming = newAsyncQueue[seq[byte]]()
+  var session: Opt[SurbSession]
   try:
-    await conn.writeLp(req.payload)
-  except LPStreamError as e:
-    return err("writeLp failed: " & e.msg)
-
-  var reply: seq[byte]
-  if req.expectReply:
-    try:
-      reply = await conn.readLp(MessageSize)
-    except LPStreamError as e:
-      return err("reply read failed: " & e.msg)
-
-  ok(MixSendResponse(ok: true, reply: reply))
+    session = (await lib.mixProto.anonymizeLocalProtocolSend(
+      incoming, framePayload(req.payload), req.proto,
+      MixDestination.exitNode(destPid), uint8(req.numSurbs)
+    )).valueOr:
+      return err("send failed: " & error)
+  except LPStreamError as exc:
+    return err("send failed: " & exc.msg)
+  if generation != lib.generation or not lib.running:
+    session.get(nil).release()
+    return err("node stopped during send")
+  if req.numSurbs > 0:
+    let task = readReplies(incoming, session.get(), messageId,
+                           req.numSurbs, req.timeoutMs.milliseconds)
+    lib.pendingReplies[messageId] = task
+    task.addCallback(proc(udata: pointer) {.gcsafe, raises: [].} =
+      lib.pendingReplies.del(messageId))
+  return ok(MixSendResponse(messageId: messageId))
 
 proc libp2pMixRlnSendMixSurbReply*(
     lib: LibMixRln, req: MixSurbReplyRequest
@@ -557,10 +621,7 @@ proc libp2pMixRlnSendMixSurbReply*(
   if surbs.len == 0 or trailing.len != 0:
     return err("SURBs must contain reply blocks without trailing data")
 
-  let prefix = PB.toBytes(req.payload.len.uint64)
-  var framed = newSeq[byte](prefix.len + req.payload.len)
-  framed[0 ..< prefix.len] = prefix.toOpenArray()
-  framed[prefix.len ..< framed.len] = req.payload
+  let framed = framePayload(req.payload)
   for surb in surbs:
     (await lib.mixProto.sendSurbReply(surb, framed)).isOkOr:
       return err(error)

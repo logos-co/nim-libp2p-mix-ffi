@@ -93,13 +93,9 @@ static void on_bool(int ec, const bool* reply, const char* em, void* ud) {
 static void on_mix_send(int ec, const MixSendResponse* r, const char* em, void* ud) {
     Waiter* w = (Waiter*)ud;
     w->err_code = ec;
-    if (r) {
-        w->reply_bool = r->ok;
-        w->reply_bool_valid = 1;
-        w->reply_bytes_len = r->reply.len < sizeof(w->reply_bytes)
-                             ? r->reply.len : sizeof(w->reply_bytes);
-        memcpy(w->reply_bytes, r->reply.data, w->reply_bytes_len);
-    }
+    if (r)
+        snprintf(w->reply_string, sizeof(w->reply_string), "%.*s",
+                 (int)r->messageId.len, r->messageId.data);
     if (em) snprintf(w->err_msg, sizeof(w->err_msg), "%s", em);
     waiter_signal(w);
 }
@@ -169,20 +165,9 @@ typedef struct {
     uint8_t         payload[4096];
     size_t          payload_len;
     char            proto[128];
-    LibMixRlnCtx*   ctx;
-    atomic_int      reply_completed;
-    atomic_int      reply_ok;
-    char            reply_err[512];
+    uint8_t         surbs[4096];
+    size_t          surbs_len;
 } InboxSlot;
-
-static void on_surb_reply(int ec, const bool* reply, const char* em, void* ud) {
-    InboxSlot* s = (InboxSlot*)ud;
-    if (em) snprintf(s->reply_err, sizeof(s->reply_err), "%s", em);
-    fprintf(stderr, "[smoke] SURB send completed: ec=%d ok=%d msg='%s'\n",
-            ec, reply && *reply, em ? em : "");
-    atomic_store(&s->reply_ok, ec == 0 && reply && *reply);
-    atomic_store(&s->reply_completed, 1);
-}
 
 static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
     InboxSlot* s = (InboxSlot*)ud;
@@ -197,26 +182,66 @@ static void on_incoming(const IncomingMixMessageEvent* evt, void* ud) {
                   ? evt->proto.len : sizeof(s->proto) - 1;
     memcpy(s->proto, evt->proto.data, nlen);
     s->proto[nlen] = '\0';
+    if (evt->surbs.len > sizeof(s->surbs)) abort();
+    s->surbs_len = evt->surbs.len;
+    if (s->surbs_len) memcpy(s->surbs, evt->surbs.data, s->surbs_len);
     atomic_store(&s->fired, 1);
     pthread_cond_signal(&s->c);
     pthread_mutex_unlock(&s->m);
-    if (evt->surbs.len == 0 || evt->surbs.data[0] != 2) {
-        snprintf(s->reply_err, sizeof(s->reply_err), "incoming event did not preserve both SURBs");
-        atomic_store(&s->reply_completed, 1);
-        return;
-    }
-    MixSurbReplyRequest req;
-    memset(&req, 0, sizeof(req));
-    req.surbs = evt->surbs;
-    req.payload.data = (uint8_t*)kReplyPayload;
-    req.payload.len = strlen(kReplyPayload);
-    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(s->ctx, &req, on_surb_reply, s);
+}
+
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t c;
+    int count;
+    char ids[8][64];
+    int invalid_payload;
+} ReplySlot;
+
+static void on_reply_received(const MixReplyReceivedEvent* evt, void* ud) {
+    ReplySlot* replies = ud;
+    pthread_mutex_lock(&replies->m);
+    if (replies->count >= 8) abort();
+    snprintf(replies->ids[replies->count], sizeof(replies->ids[0]), "%.*s",
+             (int)evt->messageId.len, evt->messageId.data);
+    replies->count++;
+    if (evt->payload.len != strlen(kReplyPayload) ||
+        memcmp(evt->payload.data, kReplyPayload, evt->payload.len))
+        replies->invalid_payload = 1;
+    pthread_cond_signal(&replies->c);
+    pthread_mutex_unlock(&replies->m);
+}
+
+static int wait_replies(ReplySlot* replies, int expected) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 15;
+    pthread_mutex_lock(&replies->m);
+    int rc = 0;
+    while (replies->count < expected && !rc)
+        rc = pthread_cond_timedwait(&replies->c, &replies->m, &deadline);
+    int failed = rc || replies->invalid_payload;
+    pthread_mutex_unlock(&replies->m);
+    return failed;
+}
+
+static int wait_inbox(InboxSlot* inbox) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 15;
+    pthread_mutex_lock(&inbox->m);
+    int rc = 0;
+    while (!atomic_load(&inbox->fired) && !rc)
+        rc = pthread_cond_timedwait(&inbox->c, &inbox->m, &deadline);
+    pthread_mutex_unlock(&inbox->m);
+    return rc;
 }
 
 // Nonblocking replies re-enter through the FFI queue, never wait on its event loop.
 typedef struct {
     LibMixRlnCtx* ctx;
     int index;
+    atomic_int membership_mode;
 } MockBackend;
 
 static atomic_int backend_errors;
@@ -247,7 +272,13 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
         snprintf(body, sizeof(body), "{\"epoch_size_sec\":10,\"max_epoch_gap\":3}");
     } else if (strcmp(method, "register_membership") == 0 ||
                strcmp(method, "get_membership_state") == 0) {
-        snprintf(body, sizeof(body), "{\"state\":\"active\",\"leaf_index\":%d}", backend->index);
+        int mode = atomic_load(&backend->membership_mode);
+        const char* states[] = {"active", "pending", "expired"};
+        if (mode == 3)
+            snprintf(body, sizeof(body), "{\"error\":{\"class\":\"transient\",\"message\":\"unavailable\"}}");
+        else
+            snprintf(body, sizeof(body), "{\"state\":\"%s\",\"leaf_index\":%d}",
+                     states[mode], backend->index);
     } else if (strcmp(method, "generate_proof") == 0) {
         // The final scoped argument is the timestamp requested by the adapter.
         char* args = strndup(evt->argsJson.data, evt->argsJson.len);
@@ -275,6 +306,14 @@ static void on_backend_request(const RlnModuleRequestEvent* evt, void* ud) {
     RlnModuleResponse response = {.requestId = evt->requestId, .responseJson = nimffi_str(body)};
     if (libp2p_mix_rln_ctx_rln_response(backend->ctx, &response, on_backend_response, NULL))
         atomic_fetch_add(&backend_errors, 1);
+}
+
+static void on_membership(const RlnMembershipEvent* evt, void* ud) {
+    Waiter* w = ud;
+    w->err_code = evt->error.len ? 1 : 0;
+    NimFfiStr value = evt->error.len ? evt->error : evt->stateJson;
+    snprintf(w->reply_string, sizeof(w->reply_string), "%.*s", (int)value.len, value.data);
+    waiter_signal(w);
 }
 
 // -------- node builder ----------------------------------------------------
@@ -609,6 +648,23 @@ int main(void) {
     }
     fprintf(stderr, "[smoke] all memberships registered through the mock shared backend\n");
 
+    Waiter observed; waiter_init(&observed);
+    (void)libp2p_mix_rln_ctx_add_on_rln_membership_listener(A, on_membership, &observed);
+    const char* expected_states[] = {"active", "pending", "expired", "unavailable"};
+    for (int mode = 0; mode < 4; mode++) {
+        atomic_store(&backends[0].membership_mode, mode);
+        pthread_mutex_lock(&observed.m);
+        observed.done = 0;
+        pthread_mutex_unlock(&observed.m);
+        Waiter refreshed; waiter_init(&refreshed);
+        (void)libp2p_mix_rln_ctx_refresh_membership(A, on_bool, &refreshed);
+        if (waiter_wait(&refreshed, 10) || refreshed.err_code ||
+            waiter_wait(&observed, 10) || observed.err_code != (mode == 3) ||
+            !strstr(observed.reply_string, expected_states[mode])) return 1;
+    }
+    atomic_store(&backends[0].membership_mode, 0);
+    fprintf(stderr, "[smoke] PASS: full membership states and refresh errors\n");
+
     // Default nodes can mount receivers, send requests, and reply with SURBs.
     MountReceiverRequest mreq;
     memset(&mreq, 0, sizeof(mreq));
@@ -626,9 +682,6 @@ int main(void) {
     pthread_mutex_init(&inbox.m, NULL);
     pthread_cond_init(&inbox.c, NULL);
     atomic_store(&inbox.fired, 0);
-    inbox.ctx = C;
-    atomic_store(&inbox.reply_completed, 0);
-    atomic_store(&inbox.reply_ok, 0);
     (void)libp2p_mix_rln_ctx_add_on_incoming_mix_message_listener(
         C, on_incoming, &inbox);
     fprintf(stderr, "[smoke] mounted receiver + event listener on C\n");
@@ -655,7 +708,6 @@ int main(void) {
     sr.proto         = nimffi_str(kTestCodec);
     sr.payload.data  = (uint8_t*)kTestPayload;
     sr.payload.len   = strlen(kTestPayload);
-    sr.expectReply   = true;
     sr.numSurbs      = 2;
     sr.timeoutMs     = 15000;
 
@@ -667,59 +719,91 @@ int main(void) {
     Waiter failed; waiter_init(&failed);
     (void)libp2p_mix_rln_ctx_send_mix_message(A, &rejected, on_mix_send, &failed);
     if (waiter_wait(&failed, 10) || !failed.err_code ||
-        !strstr(failed.err_msg, "writeLp failed: exceeds max msg size")) {
+        !strstr(failed.err_msg, "send failed:")) {
         fprintf(stderr, "oversized send was not rejected: %s\n", failed.err_msg);
         return 1;
     }
 
+    ReplySlot replies = {0};
+    pthread_mutex_init(&replies.m, NULL);
+    pthread_cond_init(&replies.c, NULL);
+    (void)libp2p_mix_rln_ctx_add_on_mix_reply_received_listener(A, on_reply_received, &replies);
+
+    int64_t invalid_counts[] = {-1, 256};
+    for (size_t i = 0; i < 2; i++) {
+        MixSendRequest invalid = sr;
+        invalid.numSurbs = invalid_counts[i];
+        Waiter bad; waiter_init(&bad);
+        (void)libp2p_mix_rln_ctx_send_mix_message(A, &invalid, on_mix_send, &bad);
+        if (waiter_wait(&bad, 10) || !bad.err_code) return 1;
+    }
+    MixSendRequest invalid_timeout = sr;
+    invalid_timeout.timeoutMs = 0;
+    Waiter bad_timeout; waiter_init(&bad_timeout);
+    (void)libp2p_mix_rln_ctx_send_mix_message(A, &invalid_timeout, on_mix_send, &bad_timeout);
+    if (waiter_wait(&bad_timeout, 10) || !bad_timeout.err_code) return 1;
+
     Waiter sw; waiter_init(&sw);
-    fprintf(stderr, "[smoke] sending mix message from A to C\n");
     (void)libp2p_mix_rln_ctx_send_mix_message(A, &sr, on_mix_send, &sw);
-    if (waiter_wait(&sw, 30) != 0 || sw.err_code != 0) {
-        fprintf(stderr, "send_mix_message failed: %s\n", sw.err_msg); return 1;
+    // The receiver has not replied: the send callback must not wait for replies.
+    if (waiter_wait(&sw, 10) || sw.err_code || !sw.reply_string[0]) {
+        fprintf(stderr, "asynchronous send failed: %s\n", sw.err_msg); return 1;
     }
-    // The legacy sender returns after the first reply; wait for both sends.
-    for (int i = 0; i < 1500 && !atomic_load(&inbox.reply_completed); ++i) {
-        struct timespec delay = {0, 10000000};
-        nanosleep(&delay, NULL);
-    }
-    if (!atomic_load(&inbox.reply_completed) || !atomic_load(&inbox.reply_ok)) {
-        fprintf(stderr, "SURB reply send failed: %s\n", inbox.reply_err);
-        return 1;
-    }
-    if (sw.reply_bytes_len != strlen(kReplyPayload) ||
-        memcmp(sw.reply_bytes, kReplyPayload, sw.reply_bytes_len) != 0) {
-        fprintf(stderr, "SURB reply payload mismatch\n");
-        return 1;
-    }
-    fprintf(stderr, "[smoke] SURB reply received by sender\n");
+    if (wait_inbox(&inbox) || inbox.surbs_len == 0 || inbox.surbs[0] != 2 ||
+        inbox.payload_len != strlen(kTestPayload) ||
+        memcmp(inbox.payload, kTestPayload, inbox.payload_len)) return 1;
 
-    fprintf(stderr, "[smoke] send returned OK; waiting for delivery event on C...\n");
-
-    // Wait for C's inbox to fire.
-    pthread_mutex_lock(&inbox.m);
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 30;
-    while (!atomic_load(&inbox.fired)) {
-        int rc = pthread_cond_timedwait(&inbox.c, &inbox.m, &ts);
-        if (rc != 0) {
-            fprintf(stderr, "TIMEOUT waiting for inbox\n");
-            pthread_mutex_unlock(&inbox.m); return 2;
-        }
+    MixSurbReplyRequest reply = {0};
+    reply.surbs.data = inbox.surbs;
+    reply.surbs.len = inbox.surbs_len;
+    reply.payload.data = (uint8_t*)kReplyPayload;
+    reply.payload.len = strlen(kReplyPayload);
+    Waiter sent; waiter_init(&sent);
+    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(C, &reply, on_bool, &sent);
+    if (waiter_wait(&sent, 15) || sent.err_code || wait_replies(&replies, 2)) return 1;
+    if (strcmp(replies.ids[0], sw.reply_string) || strcmp(replies.ids[1], sw.reply_string)) {
+        fprintf(stderr, "reply correlation failed\n"); return 1;
     }
-    pthread_mutex_unlock(&inbox.m);
+    fprintf(stderr, "[smoke] PASS: send returns before replies; two correlated reply events\n");
 
-    fprintf(stderr, "[smoke] inbox fired: proto='%s' payload_len=%zu payload='%.*s'\n",
-            inbox.proto, inbox.payload_len,
-            (int)inbox.payload_len, inbox.payload);
+    atomic_store(&inbox.fired, 0);
+    MixSendRequest no_reply = sr;
+    no_reply.numSurbs = 0;
+    no_reply.timeoutMs = 0;
+    Waiter fire; waiter_init(&fire);
+    (void)libp2p_mix_rln_ctx_send_mix_message(A, &no_reply, on_mix_send, &fire);
+    if (waiter_wait(&fire, 10) || fire.err_code || wait_inbox(&inbox) ||
+        inbox.surbs_len != 0 || !strcmp(fire.reply_string, sw.reply_string)) return 1;
+    fprintf(stderr, "[smoke] PASS: explicit zero-SURB send\n");
 
-    // Verify contents.
-    int ok = (inbox.payload_len == strlen(kTestPayload)) &&
-             (memcmp(inbox.payload, kTestPayload, inbox.payload_len) == 0) &&
-             (strcmp(inbox.proto, kTestCodec) == 0);
-    if (!ok) { fprintf(stderr, "PAYLOAD MISMATCH\n"); return 3; }
-    fprintf(stderr, "[smoke] PASS: request and SURB reply delivered end-to-end\n");
+    // A late reply must not emit an event after its reader has timed out.
+    atomic_store(&inbox.fired, 0);
+    MixSendRequest expires = sr;
+    expires.numSurbs = 1;
+    expires.timeoutMs = 1;
+    Waiter expired; waiter_init(&expired);
+    (void)libp2p_mix_rln_ctx_send_mix_message(A, &expires, on_mix_send, &expired);
+    if (waiter_wait(&expired, 10) || expired.err_code || wait_inbox(&inbox)) return 1;
+    struct timespec delay = {0, 100000000};
+    nanosleep(&delay, NULL);
+    reply.surbs.len = inbox.surbs_len;
+    Waiter late; waiter_init(&late);
+    (void)libp2p_mix_rln_ctx_send_mix_surb_reply(C, &reply, on_bool, &late);
+    if (waiter_wait(&late, 10) || late.err_code) return 1;
+    delay.tv_nsec = 500000000;
+    nanosleep(&delay, NULL);
+    pthread_mutex_lock(&replies.m);
+    int extra_replies = replies.count != 2;
+    pthread_mutex_unlock(&replies.m);
+    if (extra_replies) return 1;
+    fprintf(stderr, "[smoke] PASS: late reply ignored after timeout\n");
+
+    // Shutdown cancels an outstanding reader instead of waiting for its deadline.
+    MixSendRequest pending = sr;
+    pending.timeoutMs = 60000;
+    Waiter outstanding; waiter_init(&outstanding);
+    (void)libp2p_mix_rln_ctx_send_mix_message(A, &pending, on_mix_send, &outstanding);
+    if (waiter_wait(&outstanding, 10) || outstanding.err_code) return 1;
 
     // Cleanup.
     for (int i = 0; i < N; i++) (void)stop_node(nodes[i]);
